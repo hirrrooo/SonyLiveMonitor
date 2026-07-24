@@ -1,5 +1,54 @@
 # Release notes
 
+## v0.8
+
+**New**
+
+- **One-click desktop installer for Windows, macOS and Linux** — patching the
+  camera no longer needs the command line, Python, PMCA-RE or ADB. Connect the
+  camera in *Mass Storage* mode, press **Install on camera**, done. The
+  installer detects the camera, shows the model and handles the whole process,
+  including the reboot into app-install mode.
+- **One-button undo** — the installer ships Sony's original *Smart Remote
+  Control* (v4.30) and reinstalls it with **Restore original**. This works
+  offline and needs no backup of your own. The patched app uses a different
+  package name, so both apps coexist on the camera and you choose which to open.
+- **Update in place** — running a newer installer over an existing install
+  simply replaces it. The button reads *Update / reinstall* when the app is
+  already on the camera.
+- **Optional ADB backup** — a checkbox still saves the APK from *your* camera to
+  disk, discovering the camera's IP on the network by itself.
+- **English README and a new quick-install guide**
+  ([`docs/installer-guide.md`](installer-guide.md)). The Spanish README moved to
+  `README_es.md`; the manual step-by-step guide is unchanged and remains the
+  reference if anything fails.
+
+**Notes**
+
+- Validated end to end on a real a6000: detection, install and restore.
+- Installer filenames now carry the version (for example
+  `SonyLiveMonitor-Installer-v0.8-windows.exe`), which is always the version of
+  the camera app they install.
+- The installer is self-contained: it carries the camera APKs inside and works
+  without an internet connection. Use the installer from the same release as the
+  phone app.
+- The binaries are not code-signed. Windows SmartScreen shows a warning
+  (*More info → Run anyway*); on macOS use right-click → *Open* the first time.
+  On Linux, `chmod +x` first, and USB access may need `sudo` or a udev rule.
+- The phone apps are unchanged in this release.
+
+**Downloads**
+
+- `SonyLiveMonitor-Installer-v0.8-windows.exe` — desktop installer (Windows).
+- `SonyLiveMonitor-Installer-v0.8-macos.dmg` — desktop installer (macOS).
+- `SonyLiveMonitor-Installer-v0.8-linux` — desktop installer (Linux).
+- `SonyLiveMonitor-v0.8.apk` — Android phone app.
+- `SonyLiveMonitor-v0.8-unsigned.ipa` — iOS, sideload with AltStore.
+- `SonyLiveMonitor-a6000-avcontent-ONLY-FOR-CAMERA.apk` — patched camera app,
+  installed for you by the installer (do **not** install it on the phone).
+- `SmartRemote-a6000-original-v4.30.apk` — Sony's original camera app, for
+  restoring by hand if you ever need to.
+
 ## v0.7
 
 **New**

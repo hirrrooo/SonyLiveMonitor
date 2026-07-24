@@ -3,6 +3,23 @@
 Monitor en vivo de baja latencia para Sony a6000 (y otras camaras con la
 Sony Camera Remote API), pensado como alternativa ligera a Imaging Edge.
 
+*[Read this in English](README.md)*
+
+## Instalacion rapida
+
+Descarga el instalador de tu sistema desde la
+[pagina de Releases](https://github.com/otonielpv/SonyLiveMonitor/releases/latest),
+conecta la camara por USB y pulsa un boton. Sin linea de comandos ni Python.
+
+| Sistema | Fichero |
+|---|---|
+| Windows | `SonyLiveMonitor-Installer-vX.Y-windows.exe` |
+| macOS | `SonyLiveMonitor-Installer-vX.Y-macos.dmg` |
+| Linux | `SonyLiveMonitor-Installer-vX.Y-linux` |
+
+Guia: **[docs/installer-guide.md](docs/installer-guide.md)**. El metodo manual,
+paso a paso, sigue en [docs/a6000-live-monitor-guide.md](docs/a6000-live-monitor-guide.md).
+
 Componentes:
 
 - **App Android nativa** (`android/`) — el monitor definitivo para el movil.
@@ -10,6 +27,11 @@ Componentes:
 - **App iOS** (`ios/`, SwiftUI) — port completo de la app Android para iPhone.
 - **Prototipo de escritorio en Python** (raiz) — util para diagnostico y
   desarrollo desde el PC.
+- **Instalador de un clic** (`installer/`) — aplicacion de escritorio para
+  Windows, macOS y Linux que detecta la camara por USB e instala el Smart
+  Remote parcheado sin tocar la linea de comandos. Guia de uso:
+  [docs/installer-guide.md](docs/installer-guide.md); detalles tecnicos en
+  [installer/README.md](installer/README.md).
 
 ## App Android ("Sony Live Monitor")
 

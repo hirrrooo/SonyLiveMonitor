@@ -67,6 +67,16 @@ Two pieces are involved:
 
 ## Part A — Patch the camera
 
+> ### 🚀 There is an easier way
+>
+> You can skip all of Part A with the **one‑click installer**: connect the
+> camera, press one button, done. No command line, no PMCA‑RE setup, and it can
+> undo itself with **Restore original**.
+>
+> 👉 **[Quick install guide](installer-guide.md)**
+>
+> The manual steps below still work, and are the reference if anything fails.
+
 ### 1. Install PMCA‑RE
 
 Download from https://github.com/ma1co/Sony-PMCA-RE/releases and extract it, e.g.
@@ -84,10 +94,11 @@ python3 pmca-console.py info
 
 ### 2. Camera USB setup
 
-On the camera set **MENU → Setup → USB Connection → Mass Storage**. Turn the camera
-off, connect it with a real USB data cable, turn it on. Close any Sony / photo /
-cloud software that might grab the camera (Imaging Edge, PlayMemories, Photos,
-Dropbox, Google Drive). Keep the battery charged and an SD card inserted.
+On the camera set **MENU → Setup → USB Connection → Mass Storage**, then connect it
+with a real USB data cable. Close any Sony / photo / cloud software that might grab
+the camera (Imaging Edge, PlayMemories, Photos, Dropbox, Google Drive). Keep the
+battery charged and an SD card inserted. If the camera is not detected, unplug it,
+turn it off and on, and reconnect.
 
 ### 3. Install OpenMemories: Tweak
 
@@ -189,7 +200,15 @@ is unreachable.
 
 ## Restore the original app
 
-Reinstall the backup you pulled from your own camera:
+**The easy way:** open the one-click installer, connect the camera and press
+**Restaurar original**. It ships Sony's stock Smart Remote Control v4.30, so
+this works offline and needs no backup of your own.
+
+Because the patched app uses a different package name
+(`mod.sony.imaging.app.srctrl` vs `com.sony.imaging.app.srctrl`), both apps
+coexist — restoring does not require uninstalling anything first.
+
+**Manually**, reinstall the backup you pulled from your own camera:
 
 ```
 pmca-console-v0.18-win.exe install -f "C:\sony-a6000-backup\SmartRemote_original_a6000.apk"   # Windows
