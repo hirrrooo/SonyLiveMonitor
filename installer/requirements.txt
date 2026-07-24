@@ -1,0 +1,19 @@
+# Dependencias del instalador de SonyLiveMonitor.
+#
+# OJO: PMCA-RE NO se instala con pip: el repositorio no tiene setup.py ni
+# pyproject.toml. Se obtiene con `git clone` (ver installer/README.md o el
+# workflow .github/workflows/installer.yml) y se anade a sys.path.
+# Lo que sigue son SUS dependencias, que si estan en PyPI.
+
+asn1crypto
+axmlparserpy==0.0.4
+certifi
+pycryptodomex
+pyusb
+pyyaml
+tlslite-ng
+comtypes; sys_platform == 'win32'
+pywin32; sys_platform == 'win32'
+
+# Empaquetado del ejecutable.
+pyinstaller>=6.0

@@ -87,6 +87,9 @@ jobs:
           cp "$GITHUB_WORKSPACE/camera-patches/SonyLiveMonitor-a6000-avcontent.apk" \
             "SonyLiveMonitor-a6000-avcontent-ONLY-FOR-CAMERA.apk"
           echo "camera=android/SonyLiveMonitor-a6000-avcontent-ONLY-FOR-CAMERA.apk" >> "$GITHUB_OUTPUT"
+          # Smart Remote original de Sony, para poder volver atras a mano.
+          cp "$GITHUB_WORKSPACE/camera-patches/SmartRemote-a6000-original-v4.30.apk" .
+          echo "original=android/SmartRemote-a6000-original-v4.30.apk" >> "$GITHUB_OUTPUT"
 
       - name: Extraer notas de release del tag
         id: notes
@@ -124,6 +127,7 @@ jobs:
           files: |
             ${{ steps.apk.outputs.path }}
             ${{ steps.apk.outputs.camera }}
+            ${{ steps.apk.outputs.original }}
           body_path: ${{ steps.notes.outputs.path }}
           # Si no hay notas propias para el tag, deja que GitHub las autogenere
           generate_release_notes: ${{ steps.notes.outputs.path == '' }}

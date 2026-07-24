@@ -1,0 +1,138 @@
+name: Installer
+
+on:
+  push:
+    # Sin filtro de 'paths': al publicar un tag hay que compilar el instalador
+    # aunque ese commit no toque installer/, o la Release saldria sin binarios.
+    # (En un mismo bloque 'push', 'paths' se aplicaria tambien a los tags.)
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+    paths:
+      - "installer/**"
+      - "camera-patches/**"
+      - ".github/workflows/installer.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write   # necesario para adjuntar el instalador a la Release
+
+# Version de PMCA-RE con la que se ha probado el instalador.
+env:
+  PMCA_REF: v0.18
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            suffix: windows.exe
+            built: SonyLiveMonitor-Installer.exe
+          - os: macos-latest
+            suffix: macos.dmg
+            built: SonyLiveMonitor-Installer.dmg
+          - os: ubuntu-latest
+            suffix: linux
+            built: SonyLiveMonitor-Installer
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar Tkinter y libusb (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk libusb-1.0-0
+
+      - name: Clonar PMCA-RE
+        run: git clone --depth 1 --branch "$PMCA_REF" https://github.com/ma1co/Sony-PMCA-RE.git installer/pmca-re
+        shell: bash
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r installer/requirements.txt
+        shell: bash
+
+      - name: Compilar el ejecutable
+        run: pyinstaller --clean --noconfirm installer/installer.spec
+        shell: bash
+
+      - name: Empaquetar .dmg (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          hdiutil create -ov -volname "Sony Live Monitor" \
+            -srcfolder "dist/SonyLiveMonitor-Installer.app" \
+            "dist/SonyLiveMonitor-Installer.dmg"
+        shell: bash
+
+      - name: Comprobar que el binario arranca
+        # Se valida que el ejecutable arranca y que dentro lleva el APK y
+        # PMCA-RE. Con console=False el .exe de Windows no escribe en la
+        # consola, asi que lo que se comprueba es el codigo de salida.
+        run: |
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            BIN="dist/SonyLiveMonitor-Installer.app/Contents/MacOS/SonyLiveMonitor-Installer"
+            test -d "dist/SonyLiveMonitor-Installer.app" || exit 1
+          else
+            BIN="./dist/${{ matrix.built }}"
+          fi
+          "$BIN" --version || { echo "El instalador no arranca"; exit 1; }
+        shell: bash
+
+      - name: Comprobar el contenido empaquetado
+        # --selftest confirma que el APK de la camara y PMCA-RE viajan dentro
+        # del ejecutable; si faltasen, el instalador fallaria en manos del
+        # usuario en vez de aqui.
+        run: |
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            BIN="dist/SonyLiveMonitor-Installer.app/Contents/MacOS/SonyLiveMonitor-Installer"
+          else
+            BIN="./dist/${{ matrix.built }}"
+          fi
+          "$BIN" --selftest
+        shell: bash
+
+      - name: Renombrar el artefacto con la version
+        id: asset
+        # El nombre lleva la version de la app que el instalador va a instalar,
+        # que es la del tag. Fuera de un tag se usa el nombre de la rama.
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            VER="${GITHUB_REF_NAME}"
+          else
+            VER="${GITHUB_REF_NAME//\//-}"
+          fi
+          NAME="SonyLiveMonitor-Installer-${VER}-${{ matrix.suffix }}"
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            mv "dist/SonyLiveMonitor-Installer.dmg" "dist/$NAME"
+          else
+            mv "dist/${{ matrix.built }}" "dist/$NAME"
+          fi
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "Artefacto: $NAME"
+        shell: bash
+
+      - name: Subir como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-${{ runner.os }}
+          path: dist/${{ steps.asset.outputs.name }}
+          if-no-files-found: error
+
+      - name: Adjuntar a la Release (solo en tags v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ steps.asset.outputs.name }}
+          fail_on_unmatched_files: true

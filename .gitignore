@@ -26,6 +26,13 @@ xcuserdata/
 *.xcworkspace/xcuserdata/
 ios/**/*.xcworkspace/xcshareddata/swiftpm/Package.resolved
 
+# ---- Instalador de escritorio ----
+# PMCA-RE se clona en tiempo de compilacion, no se versiona aqui.
+installer/pmca-re/
+build/
+dist/
+*.spec.bak
+
 # ---- Varios ----
 *.log
 .env

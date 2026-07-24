@@ -9,3 +9,8 @@ gradlew text eol=lf
 
 # El jar del wrapper es binario, que git no lo toque
 *.jar   binary
+
+# Los APK tambien: si git les aplicara conversion de saltos de linea,
+# la firma dejaria de ser valida y la camara los rechazaria.
+*.apk   binary
+*.ipa   binary
