@@ -1,5 +1,42 @@
 # Release notes
 
+## v0.9
+
+**Fixed**
+
+- **Stable long iOS sessions** — live-view frames and HTTP chunks now drain
+  temporary Foundation, UIKit and ImageIO objects continuously instead of
+  retaining them for the lifetime of the monitor thread. Meter updates are
+  coalesced with video updates so a temporary UI slowdown cannot build a queue.
+- **Safe stop and resume on Android and iOS** — every monitor run has a unique
+  generation and owns an explicitly tracked stream. Going to the background,
+  opening the camera-card gallery or returning quickly can no longer leave an
+  older socket and rendering thread running alongside the new session.
+- **Lower-cost focus peaking** — iOS now reuses its full-resolution Sobel buffers
+  and uses 32-bit gradients; Android uses compact luminance and gradient buffers.
+  Both platforms sample peaking at about 8 fps while keeping the live view at its
+  normal frame rate, reducing allocation pressure, memory bandwidth and heat.
+- **Faster iOS stream parsing** — chunked HTTP data is appended directly from the
+  socket buffer, avoiding an extra temporary `Data` allocation for every chunk.
+
+**Notes**
+
+- The grid and exposure meter remain available at the same quality. Focus
+  peaking still runs at full image resolution; only its refresh cadence changed.
+- The patched camera APK is unchanged. Installers are republished so every
+  downloadable asset remains available together under the same release.
+
+**Downloads**
+
+- `SonyLiveMonitor-Installer-v0.9-windows.exe` — desktop installer (Windows).
+- `SonyLiveMonitor-Installer-v0.9-macos.dmg` — desktop installer (macOS).
+- `SonyLiveMonitor-Installer-v0.9-linux` — desktop installer (Linux).
+- `SonyLiveMonitor-v0.9.apk` — Android phone app.
+- `SonyLiveMonitor-v0.9-unsigned.ipa` — iOS, sideload with AltStore.
+- `SonyLiveMonitor-a6000-avcontent-ONLY-FOR-CAMERA.apk` — unchanged patched
+  camera app (do **not** install it on the phone).
+- `SmartRemote-a6000-original-v4.30.apk` — Sony's original camera app.
+
 ## v0.8
 
 **New**

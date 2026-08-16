@@ -1,5 +1,6 @@
 import UIKit
 import Combine
+import Darwin
 
 enum GridMode: Int, CaseIterable {
     case off, thirds, thirdsDiag, cross
@@ -148,10 +149,21 @@ final class MonitorViewModel: ObservableObject {
     private let apiQueue = DispatchQueue(label: "camera-api")
     private let defaults = UserDefaults.standard
 
-    // Leidos tambien desde el hilo del monitor (carrera benigna, como en Android)
-    private var active = false
-    private var capturing = false
+    // Una generacion identifica cada sesion. Un hilo antiguo nunca puede
+    // reactivarse al volver la app a primer plano porque conserva su generacion.
+    private let lifecycleLock = NSLock()
+    private var sessionActive = false
+    private var sessionGeneration = 0
+    private var currentStream: LiveviewStream?
     private var worker: Thread?
+
+    // Copia sincronizada del pequeno subconjunto de estado que consume el hilo
+    // de render. Las propiedades @Published siguen perteneciendo a main.
+    private let renderStateLock = NSLock()
+    private var meterOnStorage = false
+    private var peakingColorStorage = PeakingColor.off
+    private var peakingSensitivityStorage = PeakingSensitivity.medium
+    private var capturingStorage = false
     private var zoomTextGeneration = 0
     private var focusGeneration = 0
     private var toastGeneration = 0
@@ -161,7 +173,7 @@ final class MonitorViewModel: ObservableObject {
     // UIImage por frame y puede terminar agotando memoria y congelando la UI.
     private let framePublishLock = NSLock()
     private var framePublishScheduled = false
-    private var pendingFramePublish: (UIImage?, UIImage?, String?, String)?
+    private var pendingFramePublish: (UIImage?, UIImage?, Exposure?, String?, String)?
     private let exposureRefreshLock = NSLock()
     private var exposureRefreshPending = false
 
@@ -178,6 +190,9 @@ final class MonitorViewModel: ObservableObject {
                 : defaults.integer(forKey: "peakingSensitivity")
         ) ?? .medium
         hudOn = defaults.object(forKey: "hud") == nil ? true : defaults.bool(forKey: "hud")
+        meterOnStorage = meterOn
+        peakingColorStorage = peakingColor
+        peakingSensitivityStorage = peakingSensitivity
         for s in Self.settings { chipLabels[s.id] = s.id }
         chipLabels["EV"] = "EV"
         chipLabels["WB"] = "WB"
@@ -194,19 +209,78 @@ final class MonitorViewModel: ObservableObject {
     }
 
     func start() {
-        guard !active, !showGallery else { return }
-        active = true
+        guard !showGallery else { return }
+
+        lifecycleLock.lock()
+        guard !sessionActive else { lifecycleLock.unlock(); return }
+        sessionActive = true
+        sessionGeneration &+= 1
+        let generation = sessionGeneration
         UIApplication.shared.isIdleTimerDisabled = true
-        let t = Thread { [weak self] in self?.monitorLoop() }
+        let t = Thread { [weak self] in
+            autoreleasepool { self?.monitorLoop(generation: generation) }
+        }
         t.name = "monitor"
         worker = t
+        lifecycleLock.unlock()
         t.start()
     }
 
     func stop() {
-        active = false
-        UIApplication.shared.isIdleTimerDisabled = false
+        lifecycleLock.lock()
+        sessionActive = false
+        sessionGeneration &+= 1
+        let stream = currentStream
+        currentStream = nil
+        worker?.cancel()
         worker = nil
+        lifecycleLock.unlock()
+
+        // Cerrar el socket despierta inmediatamente awaitFrame/read; no dejamos
+        // que una sesion anterior sobreviva hasta el siguiente start().
+        stream?.stop()
+        UIApplication.shared.isIdleTimerDisabled = false
+
+        framePublishLock.lock()
+        pendingFramePublish = nil
+        framePublishLock.unlock()
+        image = nil
+        peakingImage = nil
+        exposure = nil
+    }
+
+    private func isSessionActive(_ generation: Int) -> Bool {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        return sessionActive && sessionGeneration == generation
+    }
+
+    private func registerStream(_ stream: LiveviewStream, generation: Int) -> Bool {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        guard sessionActive, sessionGeneration == generation else { return false }
+        currentStream = stream
+        return true
+    }
+
+    private func clearStream(_ stream: LiveviewStream) {
+        lifecycleLock.lock()
+        if currentStream === stream { currentStream = nil }
+        lifecycleLock.unlock()
+    }
+
+    private func renderSettings() -> (meter: Bool, color: PeakingColor,
+                                      sensitivity: PeakingSensitivity, capturing: Bool) {
+        renderStateLock.lock()
+        defer { renderStateLock.unlock() }
+        return (meterOnStorage, peakingColorStorage,
+                peakingSensitivityStorage, capturingStorage)
+    }
+
+    private func setCapturing(_ value: Bool) {
+        renderStateLock.lock()
+        capturingStorage = value
+        renderStateLock.unlock()
     }
 
     // -- toggles persistentes -------------------------------------------------------
@@ -235,6 +309,7 @@ final class MonitorViewModel: ObservableObject {
 
     func toggleMeter() {
         meterOn.toggle()
+        renderStateLock.lock(); meterOnStorage = meterOn; renderStateLock.unlock()
         defaults.set(meterOn, forKey: "meter")
         if !meterOn { exposure = nil }
     }
@@ -243,6 +318,7 @@ final class MonitorViewModel: ObservableObject {
         peakingColor = PeakingColor(
             rawValue: (peakingColor.rawValue + 1) % PeakingColor.allCases.count
         ) ?? .off
+        renderStateLock.lock(); peakingColorStorage = peakingColor; renderStateLock.unlock()
         defaults.set(peakingColor.rawValue, forKey: "peakingColor")
         if peakingColor == .off { peakingImage = nil }
     }
@@ -251,6 +327,9 @@ final class MonitorViewModel: ObservableObject {
         peakingSensitivity = PeakingSensitivity(
             rawValue: (peakingSensitivity.rawValue + 1) % PeakingSensitivity.allCases.count
         ) ?? .medium
+        renderStateLock.lock()
+        peakingSensitivityStorage = peakingSensitivity
+        renderStateLock.unlock()
         defaults.set(peakingSensitivity.rawValue, forKey: "peakingSensitivity")
     }
 
@@ -261,35 +340,47 @@ final class MonitorViewModel: ObservableObject {
 
     // -- bucle principal (hilo propio, nunca bloquea la UI) ---------------------------
 
-    private func monitorLoop() {
-        while active {
-            do {
-                publishMessage("Connecting to the camera...")
-                let url = try SonyCamera.startLiveview()
-                refreshChips()
-                streamAndRender(url: url)
-            } catch {
-                if !active { return }
-                let message: String
-                if error is URLError {
-                    // Aun no estamos en la WiFi de la camara: instrucciones, no error crudo
-                    message = "Waiting for the camera WiFi...\n\n"
-                        + "On the camera: 'Ctrl w/ Smartphone'.\n"
-                        + "On the iPhone: Settings > WiFi and join the\n"
-                        + "DIRECT-xxxx network shown on the camera."
-                } else {
-                    message = "Error: \(error.localizedDescription)\nRetrying..."
+    private func monitorLoop(generation: Int) {
+        while isSessionActive(generation) {
+            // Foundation/UIKit generan objetos autoreleased tambien durante los
+            // reintentos. Esta piscina exterior se vacia en cada vuelta.
+            autoreleasepool {
+                do {
+                    publishMessage("Connecting to the camera...")
+                    let url = try SonyCamera.startLiveview()
+                    guard isSessionActive(generation) else { return }
+                    refreshChips()
+                    streamAndRender(url: url, generation: generation)
+                } catch {
+                    guard isSessionActive(generation) else { return }
+                    let message: String
+                    if error is URLError {
+                        // Aun no estamos en la WiFi de la camara: instrucciones, no error crudo
+                        message = "Waiting for the camera WiFi...\n\n"
+                            + "On the camera: 'Ctrl w/ Smartphone'.\n"
+                            + "On the iPhone: Settings > WiFi and join the\n"
+                            + "DIRECT-xxxx network shown on the camera."
+                    } else {
+                        message = "Error: \(error.localizedDescription)\nRetrying..."
+                    }
+                    publishMessage(message)
+                    Thread.sleep(forTimeInterval: 2)
                 }
-                publishMessage(message)
-                Thread.sleep(forTimeInterval: 2)
             }
         }
     }
 
-    private func streamAndRender(url: String) {
+    private func streamAndRender(url: String, generation: Int) {
         let stream = LiveviewStream(url: url)
         stream.start()
-        defer { stream.stop() }
+        guard registerStream(stream, generation: generation) else {
+            stream.stop()
+            return
+        }
+        defer {
+            stream.stop()
+            clearStream(stream)
+        }
 
         var fps: Float = 0
         var fpsWindowStart = ProcessInfo.processInfo.systemUptime
@@ -299,19 +390,21 @@ final class MonitorViewModel: ObservableObject {
         var lastCameraStateAt: TimeInterval = 0
         var lastPeakingAt: TimeInterval = 0
         var peakingOverlay: UIImage?
+        var meterExposure: Exposure?
+        let peakingProcessor = FocusPeakingProcessor()
         // Ventana para la salud del enlace: contamos "huecos" (intervalos entre
         // frames mayores de 120 ms, ~3x el periodo a 25 fps) y drops por segundo.
         var linkWindowStart = fpsWindowStart
         var gapCount = 0
         var dropsAtWindowStart = 0
 
-        while active {
+        while isSessionActive(generation) {
             let frame = stream.awaitFrame(timeout: 0.25)
             let now = ProcessInfo.processInfo.systemUptime
 
             guard let frame else {
                 let stalled = now - lastFrameAt
-                if capturing {
+                if renderSettings().capturing {
                     // El liveview se pausa mientras la camara captura y procesa
                     // la foto: es normal, no es perdida de senal.
                     lastFrameAt = now
@@ -326,62 +419,74 @@ final class MonitorViewModel: ObservableObject {
                 continue
             }
 
-            guard let decoded = UIImage(data: frame.jpeg) else { continue }  // JPEG corrupto ocasional
+            // UIImage/ImageIO y CoreGraphics crean objetos autoreleased. Al
+            // vaciar por frame la memoria temporal no crece durante toda la sesion.
+            autoreleasepool {
+                guard let decoded = UIImage(data: frame.jpeg) else { return }
 
-            fpsWindowCount += 1
-            // Un intervalo largo entre frames = hueco de transporte (jitter/red)
-            if now - lastFrameAt > 0.12 { gapCount += 1 }
-            lastFrameAt = now
-            if now - fpsWindowStart >= 1 {
-                fps = Float(fpsWindowCount) / Float(now - fpsWindowStart)
-                fpsWindowStart = now
-                fpsWindowCount = 0
+                fpsWindowCount += 1
+                // Un intervalo largo entre frames = hueco de transporte (jitter/red)
+                if now - lastFrameAt > 0.12 { gapCount += 1 }
+                lastFrameAt = now
+                if now - fpsWindowStart >= 1 {
+                    fps = Float(fpsWindowCount) / Float(now - fpsWindowStart)
+                    fpsWindowStart = now
+                    fpsWindowCount = 0
+                }
+                if now - linkWindowStart >= 1 {
+                    let elapsed = now - linkWindowStart
+                    let gapsPerSec = Double(gapCount) / elapsed
+                    let dropsPerSec = Double(stream.framesDropped - dropsAtWindowStart) / elapsed
+                    updateLinkHealth(gapsPerSec: gapsPerSec, dropsPerSec: dropsPerSec)
+                    linkWindowStart = now
+                    gapCount = 0
+                    dropsAtWindowStart = stream.framesDropped
+                }
+
+                let ageMs = Int((ProcessInfo.processInfo.systemUptime - frame.receivedAt) * 1000)
+
+                if now - lastCameraStateAt >= 1 {
+                    lastCameraStateAt = now
+                    refreshExposureChips()
+                }
+
+                let settings = renderSettings()
+                // El analisis de exposicion es barato pero 7 muestras/s bastan.
+                // Se publica junto al frame para que tampoco pueda formar cola.
+                if !settings.meter {
+                    meterExposure = nil
+                } else if now - lastMeterAt >= 0.15, let cg = decoded.cgImage {
+                    lastMeterAt = now
+                    meterExposure = ExposureMeter.compute(cg)
+                }
+
+                if settings.color == .off {
+                    peakingOverlay = nil
+                } else if now - lastPeakingAt >= 0.12, let cg = decoded.cgImage {
+                    // 8 fps dan respuesta visual suficiente y reducen CPU/temperatura.
+                    lastPeakingAt = now
+                    peakingOverlay = peakingProcessor.compute(
+                        cg, color: settings.color, sensitivity: settings.sensitivity
+                    )
+                }
+
+                guard isSessionActive(generation) else { return }
+                publishFrame(decoded, peaking: peakingOverlay, exposure: meterExposure,
+                             alert: nil, fps: fps, ageMs: ageMs,
+                             dropped: stream.framesDropped)
             }
-            if now - linkWindowStart >= 1 {
-                let elapsed = now - linkWindowStart
-                let gapsPerSec = Double(gapCount) / elapsed
-                let dropsPerSec = Double(stream.framesDropped - dropsAtWindowStart) / elapsed
-                updateLinkHealth(gapsPerSec: gapsPerSec, dropsPerSec: dropsPerSec)
-                linkWindowStart = now
-                gapCount = 0
-                dropsAtWindowStart = stream.framesDropped
-            }
-
-            let ageMs = Int((ProcessInfo.processInfo.systemUptime - frame.receivedAt) * 1000)
-
-            if now - lastCameraStateAt >= 1 {
-                lastCameraStateAt = now
-                refreshExposureChips()
-            }
-
-            // El analisis de exposicion es caro: muestrear ~7 veces/s basta
-            if meterOn, now - lastMeterAt >= 0.15, let cg = decoded.cgImage {
-                lastMeterAt = now
-                let exp = ExposureMeter.compute(cg)
-                DispatchQueue.main.async { self.exposure = exp }
-            }
-
-            if peakingColor == .off {
-                peakingOverlay = nil
-            } else if now - lastPeakingAt >= 0.07, let cg = decoded.cgImage {
-                lastPeakingAt = now
-                peakingOverlay = FocusPeaking.compute(cg, color: peakingColor,
-                                                       sensitivity: peakingSensitivity)
-            }
-
-            publishFrame(decoded, peaking: peakingOverlay, alert: nil, fps: fps,
-                         ageMs: ageMs, dropped: stream.framesDropped)
         }
     }
 
-    private func publishFrame(_ image: UIImage?, peaking: UIImage? = nil, alert: String?,
+    private func publishFrame(_ image: UIImage?, peaking: UIImage? = nil,
+                              exposure: Exposure? = nil, alert: String?,
                               fps: Float, ageMs: Int, dropped: Int) {
         let hud = ageMs >= 0
             ? String(format: "%.1f fps | age %d ms | drops %d", fps, ageMs, dropped)
             : String(format: "%.1f fps | drops %d", fps, dropped)
 
         framePublishLock.lock()
-        pendingFramePublish = (image, peaking, alert, hud)
+        pendingFramePublish = (image, peaking, exposure, alert, hud)
         let shouldSchedule = !framePublishScheduled
         if shouldSchedule { framePublishScheduled = true }
         framePublishLock.unlock()
@@ -394,10 +499,11 @@ final class MonitorViewModel: ObservableObject {
             self.framePublishScheduled = false
             self.framePublishLock.unlock()
 
-            guard let (image, peaking, alert, hud) = update else { return }
+            guard let (image, peaking, exposure, alert, hud) = update else { return }
             self.statusMessage = nil
             if let image { self.image = image }
             self.peakingImage = peaking
+            self.exposure = exposure
             self.hudText = hud
             self.alertText = alert
         }
@@ -654,9 +760,9 @@ final class MonitorViewModel: ObservableObject {
             }
             return
         }
-        capturing = true
+        setCapturing(true)
         apiQueue.async {
-            defer { self.capturing = false }
+            defer { self.setCapturing(false) }
             do {
                 try SonyCamera.call("actTakePicture")
                 self.showToast("Photo taken")
@@ -809,24 +915,42 @@ final class MonitorViewModel: ObservableObject {
 
 // -- focus peaking calculado integramente en el movil -----------------------------
 
-enum FocusPeaking {
+final class FocusPeakingProcessor {
+    private let graySpace = CGColorSpaceCreateDeviceGray()
+    private let rgbSpace = CGColorSpaceCreateDeviceRGB()
+    private var width = 0
+    private var height = 0
+    private var luma = [UInt8]()
+    private var grad = [Int32]()
+    private var rgba = [UInt8]()
+
+    private func prepare(width: Int, height: Int) {
+        guard self.width != width || self.height != height else { return }
+        self.width = width
+        self.height = height
+        luma = [UInt8](repeating: 0, count: width * height)
+        // Int32 cubre de sobra el maximo Sobel y usa la mitad que Int en arm64.
+        grad = [Int32](repeating: 0, count: width * height)
+        rgba = [UInt8](repeating: 0, count: width * height * 4)
+    }
+
     /// Sobel a resolucion completa con supresion de no-maximos: solo se marca la
     /// cresta del borde (linea de ~1px) y no su relleno. Imita el peaking fino de
     /// la Sony y evita colorear bordes anchos y desenfocados. Trabajar a full-res
-    /// cuesta mas CPU, pero el peaking corre limitado (~14 fps) con margen de sobra.
-    static func compute(_ image: CGImage, color: PeakingColor,
-                        sensitivity: PeakingSensitivity) -> UIImage? {
+    /// cuesta CPU, por eso el llamador lo limita a unas 8 muestras/s.
+    func compute(_ image: CGImage, color: PeakingColor,
+                 sensitivity: PeakingSensitivity) -> UIImage? {
         guard color != .off else { return nil }
         let width = image.width
         let height = image.height
         guard width >= 3, height >= 3 else { return nil }
+        prepare(width: width, height: height)
 
-        var luma = [UInt8](repeating: 0, count: width * height)
         let drewImage = luma.withUnsafeMutableBytes { bytes -> Bool in
             guard let base = bytes.baseAddress,
                   let ctx = CGContext(data: base, width: width, height: height,
                                       bitsPerComponent: 8, bytesPerRow: width,
-                                      space: CGColorSpaceCreateDeviceGray(),
+                                      space: graySpace,
                                       bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return false }
             ctx.interpolationQuality = .low
             ctx.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
@@ -835,7 +959,6 @@ enum FocusPeaking {
         guard drewImage else { return nil }
 
         // Paso 1: magnitud del gradiente Sobel en cada pixel interior.
-        var grad = [Int](repeating: 0, count: width * height)
         luma.withUnsafeBufferPointer { l in
             grad.withUnsafeMutableBufferPointer { g in
                 for y in 1..<(height - 1) {
@@ -847,19 +970,21 @@ enum FocusPeaking {
                         let gy = -Int(l[i - width - 1]) - 2 * Int(l[i - width])
                             - Int(l[i - width + 1]) + Int(l[i + width - 1])
                             + 2 * Int(l[i + width]) + Int(l[i + width + 1])
-                        g[i] = abs(gx) + abs(gy)
+                        g[i] = Int32(abs(gx) + abs(gy))
                     }
                 }
             }
         }
 
-        var rgba = [UInt8](repeating: 0, count: width * height * 4)
+        rgba.withUnsafeMutableBytes { bytes in
+            if let base = bytes.baseAddress { memset(base, 0, bytes.count) }
+        }
         let (red, green, blue, alpha) = color.rgba
         // El contexto de salida usa alpha premultiplicado.
         let outR = UInt8(Int(red) * Int(alpha) / 255)
         let outG = UInt8(Int(green) * Int(alpha) / 255)
         let outB = UInt8(Int(blue) * Int(alpha) / 255)
-        let threshold = sensitivity.threshold
+        let threshold = Int32(sensitivity.threshold)
         // Paso 2: marcamos solo donde el gradiente supera el umbral y es un maximo
         // local frente a los cuatro vecinos. Asi la banda ancha de un borde
         // borroso se reduce a su cresta y desaparece si la transicion es suave.
@@ -879,7 +1004,7 @@ enum FocusPeaking {
             guard let base = bytes.baseAddress,
                   let ctx = CGContext(data: base, width: width, height: height,
                                       bitsPerComponent: 8, bytesPerRow: width * 4,
-                                      space: CGColorSpaceCreateDeviceRGB(),
+                                      space: rgbSpace,
                                       bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
                                         | CGBitmapInfo.byteOrder32Big.rawValue),
                   let mask = ctx.makeImage() else { return nil }
@@ -893,6 +1018,7 @@ enum FocusPeaking {
 
 enum ExposureMeter {
 
+    private static let colorSpace = CGColorSpaceCreateDeviceRGB()
     private static let linearLut: [Float] = (0..<256).map { pow(Float($0) / 255, 2.2) }
 
     /// Reescala el frame a una muestra pequena y calcula histograma, EV y recorte.
@@ -901,7 +1027,7 @@ enum ExposureMeter {
         let height = 68
         guard let ctx = CGContext(data: nil, width: width, height: height,
                                   bitsPerComponent: 8, bytesPerRow: width * 4,
-                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  space: colorSpace,
                                   bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
             return nil
         }

@@ -46,6 +46,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 class MainActivity : Activity() {
 
@@ -99,6 +100,9 @@ class MainActivity : Activity() {
 
     @Volatile private var active = false
     @Volatile private var openingGallery = false
+    private val lifecycleLock = Any()
+    private val sessionGeneration = AtomicInteger(0)
+    private var currentStream: LiveviewStream? = null
     private var worker: Thread? = null
     private var wifiLock: WifiManager.WifiLock? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
@@ -203,8 +207,9 @@ class MainActivity : Activity() {
      *  mascaras para el compositor. */
     private class FocusPeakingProcessor {
         private var sourcePixels = IntArray(0)
-        private var luma = IntArray(0)
-        private var grad = IntArray(0)   // |gx|+|gy| por pixel, reutilizado para NMS
+        private var luma = ByteArray(0)
+        // El maximo |gx|+|gy| de Sobel es 2040: Short evita 2 bytes/pixel.
+        private var grad = ShortArray(0)
         private var maskPixels = IntArray(0)
         private var maskWidth = 0
         private var maskHeight = 0
@@ -218,8 +223,8 @@ class MainActivity : Activity() {
             if (sourcePixels.size != w * h) sourcePixels = IntArray(w * h)
             if (w != maskWidth || h != maskHeight) {
                 maskWidth = w; maskHeight = h
-                luma = IntArray(w * h)
-                grad = IntArray(w * h)
+                luma = ByteArray(w * h)
+                grad = ShortArray(w * h)
                 maskPixels = IntArray(w * h)
                 masks = arrayOfNulls(2)
                 maskIndex = 0
@@ -229,25 +234,29 @@ class MainActivity : Activity() {
             val n = w * h
             while (p < n) {
                 val c = sourcePixels[p]
-                luma[p] = ((c shr 16 and 0xFF) * 54 + (c shr 8 and 0xFF) * 183 +
-                    (c and 0xFF) * 19) shr 8
+                luma[p] = (((c shr 16 and 0xFF) * 54 + (c shr 8 and 0xFF) * 183 +
+                    (c and 0xFF) * 19) shr 8).toByte()
                 p++
             }
 
             // Paso 1: magnitud del gradiente Sobel en cada pixel interior.
-            grad.fill(0)
             val threshold = sensitivity.threshold
             var y = 1
             while (y < h - 1) {
                 var x = 1
                 while (x < w - 1) {
                     val i = y * w + x
-                    val gx = -luma[i - w - 1] + luma[i - w + 1] -
-                        2 * luma[i - 1] + 2 * luma[i + 1] -
-                        luma[i + w - 1] + luma[i + w + 1]
-                    val gy = -luma[i - w - 1] - 2 * luma[i - w] - luma[i - w + 1] +
-                        luma[i + w - 1] + 2 * luma[i + w] + luma[i + w + 1]
-                    grad[i] = kotlin.math.abs(gx) + kotlin.math.abs(gy)
+                    val tl = luma[i - w - 1].toInt() and 0xFF
+                    val tc = luma[i - w].toInt() and 0xFF
+                    val tr = luma[i - w + 1].toInt() and 0xFF
+                    val ml = luma[i - 1].toInt() and 0xFF
+                    val mr = luma[i + 1].toInt() and 0xFF
+                    val bl = luma[i + w - 1].toInt() and 0xFF
+                    val bc = luma[i + w].toInt() and 0xFF
+                    val br = luma[i + w + 1].toInt() and 0xFF
+                    val gx = -tl + tr - 2 * ml + 2 * mr - bl + br
+                    val gy = -tl - 2 * tc - tr + bl + 2 * bc + br
+                    grad[i] = (kotlin.math.abs(gx) + kotlin.math.abs(gy)).toShort()
                     x++
                 }
                 y++
@@ -264,10 +273,12 @@ class MainActivity : Activity() {
                 var x = 1
                 while (x < w - 1) {
                     val i = y * w + x
-                    val g = grad[i]
+                    val g = grad[i].toInt() and 0xFFFF
                     if (g >= threshold &&
-                        g >= grad[i - 1] && g >= grad[i + 1] &&
-                        g >= grad[i - w] && g >= grad[i + w]
+                        g >= (grad[i - 1].toInt() and 0xFFFF) &&
+                        g >= (grad[i + 1].toInt() and 0xFFFF) &&
+                        g >= (grad[i - w].toInt() and 0xFFFF) &&
+                        g >= (grad[i + w].toInt() and 0xFFFF)
                     ) {
                         maskPixels[i] = argb
                     }
@@ -316,18 +327,31 @@ class MainActivity : Activity() {
     override fun onStart() {
         super.onStart()
         openingGallery = false
-        active = true
+        val thread = synchronized(lifecycleLock) {
+            if (active) return
+            active = true
+            val generation = sessionGeneration.incrementAndGet()
+            Thread({ monitorLoop(generation) }, "monitor").also { worker = it }
+        }
         acquireWifiLock()
-        worker = Thread(::monitorLoop, "monitor").also { it.start() }
+        thread.start()
     }
 
     override fun onStop() {
         super.onStop()
-        active = false
+        val (stream, thread) = synchronized(lifecycleLock) {
+            active = false
+            sessionGeneration.incrementAndGet()
+            val result = currentStream to worker
+            currentStream = null
+            worker = null
+            result
+        }
+        // close() despierta inmediatamente cualquier lectura/espera de red.
+        stream?.stop()
+        thread?.interrupt()
         wifiLock?.let { if (it.isHeld) it.release() }
         wifiLock = null
-        worker?.interrupt()
-        worker = null
         networkCallback?.let { runCatching { connectivity.unregisterNetworkCallback(it) } }
         networkCallback = null
         // Nota: NO liberamos directCallback aqui — soltarlo desconectaria la
@@ -335,6 +359,24 @@ class MainActivity : Activity() {
         // GalleryActivity comparte esta conexion: no soltar el NetworkRequest
         // al abrirla, pues las redes DIRECT sin Internet no son la ruta por defecto.
         if (!openingGallery) connectivity.bindProcessToNetwork(null)
+    }
+
+    private fun isSessionActive(generation: Int): Boolean =
+        active && sessionGeneration.get() == generation
+
+    private fun registerStream(stream: LiveviewStream, generation: Int): Boolean =
+        synchronized(lifecycleLock) {
+            if (!isSessionActive(generation)) false
+            else {
+                currentStream = stream
+                true
+            }
+        }
+
+    private fun clearStream(stream: LiveviewStream) {
+        synchronized(lifecycleLock) {
+            if (currentStream === stream) currentStream = null
+        }
     }
 
     override fun onDestroy() {
@@ -1469,8 +1511,8 @@ class MainActivity : Activity() {
 
     // -- bucle principal (hilo propio, nunca bloquea la UI) ---------------------------
 
-    private fun monitorLoop() {
-        while (active) {
+    private fun monitorLoop(generation: Int) {
+        while (isSessionActive(generation)) {
             try {
                 drawMessage("Waiting for camera WiFi...\n(Connect button in the panel)")
                 bindToWifi()
@@ -1479,12 +1521,13 @@ class MainActivity : Activity() {
                     throw CameraException("Camera not found on this WiFi")
                 }
                 val url = SonyCamera.startLiveview(SonyCamera.cameraEndpoint)
+                if (!isSessionActive(generation)) return
                 refreshChips()
-                streamAndRender(url)
+                streamAndRender(url, generation)
             } catch (e: InterruptedException) {
                 return
             } catch (e: Exception) {
-                if (!active) return
+                if (!isSessionActive(generation)) return
                 drawMessage("Error: ${e.message ?: e.javaClass.simpleName}\nRetrying...")
                 SystemClock.sleep(2000)
             }
@@ -1524,9 +1567,13 @@ class MainActivity : Activity() {
         connectivity.bindProcessToNetwork(network)
     }
 
-    private fun streamAndRender(url: String) {
+    private fun streamAndRender(url: String, generation: Int) {
         val stream = LiveviewStream(url)
         stream.start()
+        if (!registerStream(stream, generation)) {
+            stream.stop()
+            return
+        }
 
         // Dos bitmaps reutilizados en alternancia: mientras la GPU consume
         // uno, el siguiente frame se decodifica en el otro.
@@ -1546,7 +1593,7 @@ class MainActivity : Activity() {
         var lastPeakingAt = 0L
 
         try {
-            while (active) {
+            while (isSessionActive(generation)) {
                 val frame = stream.awaitFrame(250)
                 val now = SystemClock.elapsedRealtime()
 
@@ -1607,7 +1654,7 @@ class MainActivity : Activity() {
                 }
                 peakingOverlay = when {
                     peakingColor == PeakingColor.OFF -> null
-                    now - lastPeakingAt >= 70 -> {
+                    now - lastPeakingAt >= 120 -> {
                         lastPeakingAt = now
                         peakingProcessor.compute(bitmap, peakingColor, peakingSensitivity)
                     }
@@ -1617,6 +1664,7 @@ class MainActivity : Activity() {
             }
         } finally {
             stream.stop()
+            clearStream(stream)
         }
     }
 

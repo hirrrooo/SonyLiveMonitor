@@ -42,6 +42,7 @@ class LiveviewStream(private val url: String) {
     private var thread: Thread? = null
 
     fun start() {
+        if (running) return
         running = true
         thread = Thread(::readerLoop, "liveview-reader").also { it.start() }
     }
@@ -49,7 +50,12 @@ class LiveviewStream(private val url: String) {
     fun stop() {
         running = false
         closeSocket()
+        synchronized(lock) {
+            latest = null
+            lock.notifyAll()
+        }
         thread?.interrupt()
+        thread = null
     }
 
     /** Espera (con timeout) el frame mas reciente aun no consumido. */
@@ -57,6 +63,7 @@ class LiveviewStream(private val url: String) {
         synchronized(lock) {
             val deadline = SystemClock.elapsedRealtime() + timeoutMs
             while (latest == null) {
+                if (!running) return null
                 val left = deadline - SystemClock.elapsedRealtime()
                 if (left <= 0) return null
                 try {

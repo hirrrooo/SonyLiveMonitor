@@ -62,15 +62,24 @@ final class LiveviewStream {
     private func setStatus(_ s: String) { cond.lock(); statusStorage = s; cond.unlock() }
 
     func start() {
-        cond.lock(); runningStorage = true; cond.unlock()
-        let t = Thread { [weak self] in self?.readerLoop() }
+        cond.lock()
+        guard !runningStorage else { cond.unlock(); return }
+        runningStorage = true
+        cond.unlock()
+        let t = Thread { [weak self] in
+            autoreleasepool { self?.readerLoop() }
+        }
         t.name = "liveview-reader"
         thread = t
         t.start()
     }
 
     func stop() {
-        cond.lock(); runningStorage = false; cond.broadcast(); cond.unlock()
+        cond.lock()
+        runningStorage = false
+        latest = nil
+        cond.broadcast()
+        cond.unlock()
         closeSocket()
     }
 
@@ -80,6 +89,7 @@ final class LiveviewStream {
         cond.lock()
         defer { cond.unlock() }
         while latest == nil {
+            if !runningStorage { return nil }
             if !cond.wait(until: deadline) { return nil }
         }
         let frame = latest
@@ -185,31 +195,35 @@ final class LiveviewStream {
 
     private func parseContainer(_ input: FrameInput) throws {
         while isRunning {
-            let common = [UInt8](try input.readFully(count: 8))
-            guard common[0] == 0xFF else { throw LiveviewError("stream misaligned (common header)") }
-            let payloadType = Int(common[1])
-            let sequence = (Int(common[2]) << 8) | Int(common[3])
+            try autoreleasepool {
+                let common = try input.readFully(count: 8)
+                guard common[0] == 0xFF else {
+                    throw LiveviewError("stream misaligned (common header)")
+                }
+                let payloadType = Int(common[1])
+                let sequence = (Int(common[2]) << 8) | Int(common[3])
 
-            let ph = [UInt8](try input.readFully(count: 128))
-            guard ph[0] == 0x24, ph[1] == 0x35, ph[2] == 0x68, ph[3] == 0x79 else {
-                throw LiveviewError("stream misaligned (payload header)")
+                let ph = try input.readFully(count: 128)
+                guard ph[0] == 0x24, ph[1] == 0x35, ph[2] == 0x68, ph[3] == 0x79 else {
+                    throw LiveviewError("stream misaligned (payload header)")
+                }
+                let dataSize = (Int(ph[4]) << 16) | (Int(ph[5]) << 8) | Int(ph[6])
+                let padding = Int(ph[7])
+
+                let data = try input.readFully(count: dataSize)
+                try input.skip(padding)
+
+                guard payloadType == 0x01 else { return }  // frame info u otros: ignorar
+
+                let frame = Frame(jpeg: data, sequence: sequence,
+                                  receivedAt: ProcessInfo.processInfo.systemUptime)
+                cond.lock()
+                framesReadStorage += 1
+                if latest != nil { framesDroppedStorage += 1 }
+                latest = frame
+                cond.broadcast()
+                cond.unlock()
             }
-            let dataSize = (Int(ph[4]) << 16) | (Int(ph[5]) << 8) | Int(ph[6])
-            let padding = Int(ph[7])
-
-            let data = try input.readFully(count: dataSize)
-            try input.skip(padding)
-
-            guard payloadType == 0x01 else { continue }  // frame info u otros: ignorar
-
-            let frame = Frame(jpeg: data, sequence: sequence,
-                              receivedAt: ProcessInfo.processInfo.systemUptime)
-            cond.lock()
-            framesReadStorage += 1
-            if latest != nil { framesDroppedStorage += 1 }
-            latest = frame
-            cond.broadcast()
-            cond.unlock()
         }
     }
 
@@ -270,6 +284,13 @@ private final class BufferedInput: FrameInput {
 
     func readFully(count: Int) throws -> Data {
         var out = Data(capacity: count)
+        try appendFully(count: count, to: &out)
+        return out
+    }
+
+    /// Anade bytes directamente desde el buffer del socket, evitando el Data
+    /// temporal que antes creaba ChunkedInput por cada fragmento HTTP.
+    func appendFully(count: Int, to out: inout Data) throws {
         var left = count
         while left > 0 {
             if pos == limit { try fill() }
@@ -278,7 +299,6 @@ private final class BufferedInput: FrameInput {
             pos += take
             left -= take
         }
-        return out
     }
 
     func skip(_ count: Int) throws {
@@ -320,7 +340,7 @@ private final class ChunkedInput: FrameInput {
         while left > 0 {
             try nextChunk()
             let take = min(left, remaining)
-            out.append(try src.readFully(count: take))
+            try src.appendFully(count: take, to: &out)
             remaining -= take
             left -= take
         }
