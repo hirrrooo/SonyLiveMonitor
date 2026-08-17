@@ -1,5 +1,61 @@
 # Release notes
 
+## v0.10
+
+**New**
+
+- **Optional GPS metadata for original JPEG and Sony ARW downloads** on Android
+  and iOS. Enable `Location` before shooting; the app keeps a private rolling
+  location history and matches it to the camera capture time.
+- A single Sony `getEvent(true)` listener now detects physical and in-app shutter
+  releases (`StillCapturing`/`StillSaving`) and freezes the latest phone location
+  at that moment. The same event stream updates ISO, shutter speed, aperture,
+  focus, flash, timer, white balance, exposure compensation, mode and zoom without
+  the previous once-per-second camera polling.
+- JPEG image data is copied without resizing or recompression. ARW files receive
+  a standard GPS IFD while every original RAW payload byte remains unchanged.
+- Downloads use temporary files and are only published after metadata writing
+  succeeds. A photo with no matching location is saved unchanged with a warning.
+
+**Compatibility and validation**
+
+- Capture times are matched within five minutes. The matcher also handles older
+  Sony cameras that label local wall-clock time as UTC, avoiding incorrect
+  results when the camera and phone otherwise show the same time.
+- Validated end to end on a real Sony a6000 with photos taken using both the
+  physical shutter and the app shutter. Full-resolution 6000 x 4000 JPEGs kept
+  their original compressed image data, and matching JPEG/ARW pairs received the
+  same standard GPS coordinates without altering the RAW image payload.
+
+**Privacy and scope**
+
+- Location is opt-in and requested only when the user enables the feature.
+- Tracking stops when the app is no longer in use. Samples older than 24 hours
+  are discarded and never leave the phone.
+- Files on the camera card are read-only and never geotagged in place.
+
+**Notes**
+
+- Enable `Location` before taking the photo and keep phone location services
+  available. Existing photos can only be matched when their capture time falls
+  within the location history recorded by the app.
+- GPS metadata stores coordinates (and altitude/time when available), not a
+  human-readable place name. Applications such as Lightroom can display or
+  reverse-geocode those coordinates.
+- The patched camera APK is unchanged. Installers are republished so every
+  downloadable asset remains available together under the same release.
+
+**Downloads**
+
+- `SonyLiveMonitor-Installer-v0.10-windows.exe` — desktop installer (Windows).
+- `SonyLiveMonitor-Installer-v0.10-macos.dmg` — desktop installer (macOS).
+- `SonyLiveMonitor-Installer-v0.10-linux` — desktop installer (Linux).
+- `SonyLiveMonitor-v0.10.apk` — Android phone app.
+- `SonyLiveMonitor-v0.10-unsigned.ipa` — iOS, sideload with AltStore.
+- `SonyLiveMonitor-a6000-avcontent-ONLY-FOR-CAMERA.apk` — unchanged patched
+  camera app (do **not** install it on the phone).
+- `SmartRemote-a6000-original-v4.30.apk` — Sony's original camera app.
+
 ## v0.9
 
 **Fixed**

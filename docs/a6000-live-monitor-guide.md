@@ -187,6 +187,14 @@ is unreachable.
   the full‑screen viewer, pinch to zoom, and **swipe left/right** between shots.
 - **Download JPEG / RAW:** select one or more photos, tap **Download**, choose JPEG,
   RAW, or JPEG+RAW. A centered progress dialog blocks the screen until it finishes.
+- **Geotag JPEG and RAW:** turn **Location: ON** on before taking photos. While
+  SonyLiveMonitor is in use, the phone keeps a local 24-hour location history.
+  While connected, the app listens for the camera's `StillCapturing` event and
+  freezes the latest phone position for physical and in-app shutter releases.
+  On download, each JPEG and ARW is matched to its capture time and receives GPS
+  metadata without changing image resolution or recompressing it. The camera-card
+  copy is never changed. If no location exists within five minutes, the file is
+  saved unchanged and the app shows a warning.
 - **Delete from the camera card:** select one or more photos and tap **Delete**.
   Android and iOS require a second confirmation because the operation cannot be
   undone. The button appears only when the camera reports API support.

@@ -15,9 +15,9 @@ val hasReleaseSigning = listOf(
 ).all { !it.isNullOrBlank() }
 
 val appVersionCode = providers.gradleProperty("versionCode")
-    .orNull?.toIntOrNull() ?: 9
+    .orNull?.toIntOrNull() ?: 10
 val appVersionName = providers.gradleProperty("versionName")
-    .orNull ?: "0.9"
+    .orNull ?: "0.10"
 
 android {
     namespace = "com.otoniel.sonylivemonitor"
@@ -60,4 +60,15 @@ android {
         jvmTarget = "17"
     }
 
+}
+
+dependencies {
+    implementation("androidx.exifinterface:exifinterface:1.4.2")
+    testImplementation("junit:junit:4.13.2")
+}
+
+tasks.withType<Test>().configureEach {
+    listOf("arwSample", "arwOutput").forEach { name ->
+        System.getProperty(name)?.let { systemProperty(name, it) }
+    }
 }

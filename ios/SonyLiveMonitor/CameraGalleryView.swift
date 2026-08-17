@@ -48,6 +48,7 @@ final class GalleryModel: ObservableObject {
     @Published var toast: String?
     @Published var viewerIndex: Int?
     @Published var customFolder = UserDefaults.standard.data(forKey: "download_bookmark") != nil
+    @Published var geotagEnabled = GeotagManager.shared.enabled
 
     private let apiQueue = DispatchQueue(label: "gallery-api")
     // Una sola miniatura cada vez: el servidor de la a6000 es muy limitado.
@@ -68,6 +69,7 @@ final class GalleryModel: ObservableObject {
     // -- apertura y paginado ----------------------------------------------------
 
     func open() {
+        GeotagManager.shared.startIfEnabled()
         apiQueue.async {
             _ = try? SonyCamera.call("stopLiveview")
             var lastError: Error? = CameraError("Could not enable Contents Transfer")
@@ -297,11 +299,11 @@ final class GalleryModel: ObservableObject {
         }
         let length = response.expectedContentLength
 
-        let (dir, scoped) = try destinationDirectory()
-        defer { if scoped { dir.stopAccessingSecurityScopedResource() } }
-        let dest = dir.appendingPathComponent(original.fileName)
-        FileManager.default.createFile(atPath: dest.path, contents: nil)
-        let handle = try FileHandle(forWritingTo: dest)
+        let temp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("sony-download-\(UUID().uuidString).\(original.fileName.split(separator: ".").last ?? "bin")")
+        FileManager.default.createFile(atPath: temp.path, contents: nil)
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let handle = try FileHandle(forWritingTo: temp)
         defer { try? handle.close() }
 
         var buffer = Data()
@@ -327,6 +329,37 @@ final class GalleryModel: ObservableObject {
             }
         }
         try handle.write(contentsOf: buffer)
+        try handle.close()
+
+        let fix = GeotagManager.shared.enabled ? GeotagManager.shared.closest(to: image.created) : nil
+        var geotagError: Error? = nil
+        if let fix {
+            do {
+                if original.kind == "raw" { try ArwGpsWriter.write(fix, to: temp) }
+                else { try JpegGpsWriter.write(fix, to: temp) }
+            } catch {
+                geotagError = error
+            }
+        }
+        let (dir, scoped) = try destinationDirectory()
+        defer { if scoped { dir.stopAccessingSecurityScopedResource() } }
+        let dest = dir.appendingPathComponent(original.fileName)
+        if FileManager.default.fileExists(atPath: dest.path) {
+            _ = try FileManager.default.replaceItemAt(dest, withItemAt: temp)
+        } else {
+            try FileManager.default.copyItem(at: temp, to: dest)
+        }
+        if GeotagManager.shared.enabled && fix == nil {
+            await MainActor.run { self.showToast("\(original.fileName): no matching location; saved unchanged") }
+        } else if geotagError != nil {
+            await MainActor.run { self.showToast("\(original.fileName): geotag failed; saved unchanged") }
+        }
+    }
+
+    func toggleGeotagging() {
+        geotagEnabled.toggle()
+        GeotagManager.shared.setEnabled(geotagEnabled)
+        showToast(geotagEnabled ? "Geotagging enabled for future photos" : "Geotagging disabled")
     }
 
     // -- destino de guardado ---------------------------------------------------------
@@ -518,6 +551,10 @@ struct CameraGalleryView: View {
                 Button(model.customFolder ? "Folder: custom" : "Folder: default") { askFolder = true }
                     .frame(maxWidth: .infinity)
             }
+            Button(model.geotagEnabled ? "Location: ON" : "Location: OFF") {
+                model.toggleGeotagging()
+            }
+            .frame(maxWidth: .infinity)
         }
         .buttonStyle(.bordered)
         .tint(.white)

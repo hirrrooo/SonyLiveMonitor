@@ -42,6 +42,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Toast
 import org.json.JSONArray
+import org.json.JSONObject
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -96,7 +97,11 @@ class MainActivity : Activity() {
     private lateinit var surface: SurfaceView
     private lateinit var connectivity: ConnectivityManager
     private val apiExecutor = Executors.newSingleThreadExecutor()
-    private val exposureRefreshPending = AtomicBoolean(false)
+    private val eventExecutor = Executors.newSingleThreadExecutor()
+    private val eventListenerRunning = AtomicBoolean(false)
+    private val captureEventLock = Any()
+    private var lastCameraStatus: String? = null
+    private var appCapturePendingAt = 0L
 
     @Volatile private var active = false
     @Volatile private var openingGallery = false
@@ -152,6 +157,7 @@ class MainActivity : Activity() {
 
     private lateinit var btnConnect: Button
     private lateinit var btnGallery: Button
+    private lateinit var btnGeotag: Button
     private val zoomChips = mutableListOf<Button>()
     private lateinit var btnGrid: Button
     private lateinit var btnMeter: Button
@@ -167,6 +173,7 @@ class MainActivity : Activity() {
     @Volatile private var hudOn = true
     @Volatile private var shootMode = "still"
     @Volatile private var movieRecording = false
+    @Volatile private var evStepIndex = 1
 
     // Salud del WiFi de la camara: ayuda a saber si unos fps bajos vienen de la
     // senal (RSSI/velocidad de enlace) o de la propia camara. Se muestrea en el
@@ -326,6 +333,8 @@ class MainActivity : Activity() {
 
     override fun onStart() {
         super.onStart()
+        GeotagManager.start(applicationContext)
+        updateGeotagChip()
         openingGallery = false
         val thread = synchronized(lifecycleLock) {
             if (active) return
@@ -339,6 +348,7 @@ class MainActivity : Activity() {
 
     override fun onStop() {
         super.onStop()
+        GeotagManager.stop()
         val (stream, thread) = synchronized(lifecycleLock) {
             active = false
             sessionGeneration.incrementAndGet()
@@ -350,6 +360,7 @@ class MainActivity : Activity() {
         // close() despierta inmediatamente cualquier lectura/espera de red.
         stream?.stop()
         thread?.interrupt()
+        SonyCamera.cancelEventWait()
         wifiLock?.let { if (it.isHeld) it.release() }
         wifiLock = null
         networkCallback?.let { runCatching { connectivity.unregisterNetworkCallback(it) } }
@@ -383,7 +394,9 @@ class MainActivity : Activity() {
         super.onDestroy()
         directCallback?.let { runCatching { connectivity.unregisterNetworkCallback(it) } }
         directCallback = null
+        SonyCamera.cancelEventWait()
         apiExecutor.shutdownNow()
+        eventExecutor.shutdownNow()
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -636,6 +649,13 @@ class MainActivity : Activity() {
             openingGallery = true
             startActivity(Intent(this, CameraGalleryActivity::class.java))
         }
+        btnGeotag = chip(appChips, if (GeotagManager.isEnabled(this)) "Location: on" else "Location: off") {
+            val enable = !GeotagManager.isEnabled(this)
+            GeotagManager.setEnabled(this, enable)
+            updateGeotagChip()
+            toast(if (enable) "Geotagging enabled for future photos" else "Geotagging disabled")
+        }
+        highlightValue(btnGeotag, GeotagManager.isEnabled(this))
         chip(appChips, "Diag") { showDiagnostics() }
 
         controlGrid = GridLayout(this)
@@ -991,35 +1011,6 @@ class MainActivity : Activity() {
                 if (movement == "start") toast("Zoom: requires a power zoom lens")
             }
         }
-        pollZoomPosition()
-        if (movement == "stop") {
-            // El motor sigue frenando un instante: leer tambien la posicion final
-            surface.postDelayed({ pollZoomPosition() }, 600)
-        }
-    }
-
-    /**
-     * Lee la posicion de zoom via getEvent. La API solo da porcentaje 0-100;
-     * los mm se estiman mapeando linealmente al rango 16-50 del PZ del kit.
-     */
-    private fun pollZoomPosition() {
-        apiExecutor.execute {
-            runCatching {
-                val r = SonyCamera.call(SonyCamera.cameraEndpoint, "getEvent", JSONArray().put(false))
-                for (i in 0 until r.length()) {
-                    val o = r.optJSONObject(i) ?: continue
-                    if (o.has("zoomPosition")) {
-                        val pct = o.getInt("zoomPosition")
-                        // Progresion geometrica: los zoom motorizados avanzan
-                        // a ratio constante, no a mm constantes (16-50 PZ)
-                        val mm = 16.0 * Math.pow(50.0 / 16.0, pct / 100.0)
-                        zoomText = "Zoom %d%%  ~%.0f mm".format(pct, mm)
-                        zoomTextUntil = SystemClock.elapsedRealtime() + 2500
-                        break
-                    }
-                }
-            }
-        }
     }
 
     private fun applySetting(setMethod: String, value: Any, onOk: () -> Unit) {
@@ -1036,36 +1027,12 @@ class MainActivity : Activity() {
     /** Actualiza las etiquetas de los chips con los valores actuales de la camara. */
     private fun refreshChips() {
         apiExecutor.execute {
-            // getEvent es la instantanea real del estado. Algunos modelos no
-            // rellenan de forma fiable el primer elemento de getAvailable*
-            // hasta que el ajuste se cambia desde el remoto.
-            val eventKeys = mapOf(
-                "ISO" to "currentIsoSpeedRate",
-                "Shutter" to "currentShutterSpeed",
-                "Aperture" to "currentFNumber",
-                "Focus" to "currentFocusMode",
-                "Flash" to "currentFlashMode",
-                "Timer" to "currentSelfTimer",
-            )
             val currentByTitle = mutableMapOf<String, String>()
             settings.forEach { setting ->
                 runCatching {
                     currentByTitle[setting.title] = SonyCamera.call(
                         SonyCamera.cameraEndpoint, setting.currentMethod,
                     ).get(0).toString()
-                }
-            }
-            runCatching {
-                val events = SonyCamera.call(
-                    SonyCamera.cameraEndpoint, "getEvent", JSONArray().put(false), version = "1.1",
-                )
-                for (i in 0 until events.length()) {
-                    val event = events.optJSONObject(i) ?: continue
-                    eventKeys.forEach { (title, key) ->
-                        if (!currentByTitle.containsKey(title) && event.has(key) && !event.isNull(key)) {
-                            currentByTitle[title] = event.get(key).toString()
-                        }
-                    }
                 }
             }
             settings.forEach { s ->
@@ -1084,7 +1051,8 @@ class MainActivity : Activity() {
             }
             runCatching {
                 val r = SonyCamera.call(SonyCamera.cameraEndpoint, "getAvailableExposureCompensation")
-                val stepEv = if (r.getInt(3) == 2) 0.5 else 1.0 / 3.0
+                evStepIndex = r.getInt(3)
+                val stepEv = if (evStepIndex == 2) 0.5 else 1.0 / 3.0
                 val label = String.format("%+.1f EV", r.getInt(0) * stepEv)
                 runOnUiThread { chipEv.text = label }
             }
@@ -1100,6 +1068,128 @@ class MainActivity : Activity() {
             }
             applyCapabilities()
         }
+    }
+
+    /**
+     * Mantiene una sola espera notificativa. Sony documenta que getEvent(true)
+     * despierta tanto por llamadas remotas como por controles fisicos.
+     */
+    private fun startCameraEventListener(generation: Int) {
+        if (!eventListenerRunning.compareAndSet(false, true)) return
+        synchronized(captureEventLock) { lastCameraStatus = null }
+        eventExecutor.execute {
+            var version = "1.1"
+            try {
+                while (isSessionActive(generation) && !Thread.currentThread().isInterrupted) {
+                    try {
+                        val events = SonyCamera.call(
+                            SonyCamera.cameraEndpoint, "getEvent", JSONArray().put(true),
+                            version = version, readTimeoutMs = 65_000, eventWait = true,
+                        )
+                        if (isSessionActive(generation)) handleCameraEvents(events)
+                    } catch (_: Exception) {
+                        if (!isSessionActive(generation)) break
+                        // getEvent 1.0 conserva long polling y cubre modelos que
+                        // no anuncian la extension 1.1.
+                        if (version == "1.1") version = "1.0" else SystemClock.sleep(500)
+                    }
+                }
+            } finally {
+                eventListenerRunning.set(false)
+                if (active) startCameraEventListener(sessionGeneration.get())
+            }
+        }
+    }
+
+    private fun handleCameraEvents(result: JSONArray) {
+        val objects = mutableListOf<JSONObject>()
+        fun collect(value: Any?) {
+            when (value) {
+                is JSONObject -> objects += value
+                is JSONArray -> for (i in 0 until value.length()) collect(value.opt(i))
+            }
+        }
+        collect(result)
+
+        val labels = mutableMapOf<Setting, String>()
+        val keys = mapOf(
+            "currentIsoSpeedRate" to "ISO",
+            "currentShutterSpeed" to "Shutter",
+            "currentFNumber" to "Aperture",
+            "currentFocusMode" to "Focus",
+            "currentFlashMode" to "Flash",
+            "currentSelfTimer" to "Timer",
+        )
+        var evLabel: String? = null
+        var wbLabel: String? = null
+        var modeLabel: String? = null
+        var zoomPosition: Int? = null
+
+        objects.forEach { event ->
+            event.optString("cameraStatus").takeIf { it.isNotBlank() }?.let(::handleCameraStatus)
+            keys.forEach { (key, title) ->
+                if (event.has(key) && !event.isNull(key)) {
+                    settings.firstOrNull { it.title == title }?.let { setting ->
+                        labels[setting] = setting.chipLabel(event.get(key).toString())
+                    }
+                }
+            }
+            if (event.has("currentExposureCompensation")) {
+                if (event.has("stepIndexOfExposureCompensation")) {
+                    evStepIndex = event.optInt("stepIndexOfExposureCompensation", evStepIndex)
+                }
+                val step = if (evStepIndex == 2) 0.5 else 1.0 / 3.0
+                evLabel = String.format("%+.1f EV", event.optInt("currentExposureCompensation") * step)
+            }
+            val wb = event.optString("currentWhiteBalanceMode")
+            if (wb.isNotBlank()) {
+                wbLabel = "WB " + wb.removeSuffix(" WB")
+            }
+            val mode = event.optString("currentShootMode")
+            if (mode.isNotBlank()) {
+                shootMode = mode
+                modeLabel = if (mode == "movie") "Mode: Video" else "Mode: Photo"
+            }
+            if (event.has("zoomPosition")) zoomPosition = event.optInt("zoomPosition")
+        }
+
+        zoomPosition?.let { pct ->
+            val mm = 16.0 * Math.pow(50.0 / 16.0, pct / 100.0)
+            zoomText = "Zoom %d%%  ~%.0f mm".format(pct, mm)
+            zoomTextUntil = SystemClock.elapsedRealtime() + 2500
+        }
+        if (labels.isNotEmpty() || evLabel != null || wbLabel != null || modeLabel != null) {
+            runOnUiThread {
+                labels.forEach { (setting, label) -> chips[setting]?.text = label }
+                evLabel?.let { chipEv.text = it }
+                wbLabel?.let { chipWb.text = it }
+                modeLabel?.let { chipShootMode.text = it }
+            }
+        }
+    }
+
+    private fun handleCameraStatus(status: String) {
+        var recordPhysicalCapture = false
+        synchronized(captureEventLock) {
+            val previous = lastCameraStatus
+            if (status == previous) return
+            val wasCapturing = previous == "StillCapturing" || previous == "StillSaving"
+            when (status) {
+                "StillCapturing", "StillSaving" -> {
+                    capturing = true
+                    if (!wasCapturing) {
+                        val pendingAppShot = System.currentTimeMillis() - appCapturePendingAt in 0..30_000
+                        if (pendingAppShot) appCapturePendingAt = 0L else recordPhysicalCapture = true
+                    }
+                }
+                "IDLE" -> {
+                    capturing = false
+                    if (wasCapturing) appCapturePendingAt = 0L
+                }
+            }
+            lastCameraStatus = status
+        }
+        if (recordPhysicalCapture) GeotagManager.recordCapture(applicationContext)
     }
 
     /** Esconde lo que esta camara no soporta (galeria, zoom motorizado...). */
@@ -1142,57 +1232,6 @@ class MainActivity : Activity() {
         }
     }
 
-    /** Mantiene ISO, shutter y apertura sincronizados con los diales fisicos. */
-    private fun refreshExposureChips() {
-        if (!exposureRefreshPending.compareAndSet(false, true)) return
-        apiExecutor.execute {
-            try {
-                val exposureSettings = settings.filter {
-                    it.title == "ISO" || it.title == "Shutter" || it.title == "Aperture"
-                }
-                val values = mutableMapOf<String, String>()
-                runCatching {
-                    val events = SonyCamera.call(
-                        SonyCamera.cameraEndpoint, "getEvent", JSONArray().put(false), version = "1.1",
-                    )
-                    val keys = mapOf(
-                        "ISO" to "currentIsoSpeedRate",
-                        "Shutter" to "currentShutterSpeed",
-                        "Aperture" to "currentFNumber",
-                    )
-                    for (i in 0 until events.length()) {
-                        val event = events.optJSONObject(i) ?: continue
-                        keys.forEach { (title, key) ->
-                            if (!values.containsKey(title) && event.has(key) && !event.isNull(key)) {
-                                values[title] = event.get(key).toString()
-                            }
-                        }
-                    }
-                }
-                exposureSettings.forEach { setting ->
-                    if (!values.containsKey(setting.title)) {
-                        runCatching {
-                            values[setting.title] = SonyCamera.call(
-                                SonyCamera.cameraEndpoint, setting.currentMethod,
-                            ).get(0).toString()
-                        }.recoverCatching {
-                            values[setting.title] = SonyCamera.call(
-                                SonyCamera.cameraEndpoint, setting.getMethod,
-                            ).get(0).toString()
-                        }
-                    }
-                }
-                runOnUiThread {
-                    exposureSettings.forEach { setting ->
-                        values[setting.title]?.let { chips[setting]?.text = setting.chipLabel(it) }
-                    }
-                }
-            } finally {
-                exposureRefreshPending.set(false)
-            }
-        }
-    }
-
     private fun takePicture() {
         if (shootMode == "movie") {
             // En modo video el disparador inicia/detiene la grabacion
@@ -1215,12 +1254,14 @@ class MainActivity : Activity() {
             return
         }
         capturing = true
+        synchronized(captureEventLock) { appCapturePendingAt = System.currentTimeMillis() }
+        GeotagManager.recordCapture(applicationContext)
         apiExecutor.execute {
             try {
                 SonyCamera.call(SonyCamera.cameraEndpoint, "actTakePicture")
                 toast("Photo taken")
-                refreshChips()  // los valores pueden cambiar tras el disparo (p.ej. ISO auto)
             } catch (e: Exception) {
+                synchronized(captureEventLock) { appCapturePendingAt = 0L }
                 toast("Shutter: ${e.message}")
             } finally {
                 capturing = false
@@ -1308,6 +1349,17 @@ class MainActivity : Activity() {
         grantResults: IntArray,
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == GeotagManager.PERMISSION_REQUEST) {
+            if (grantResults.any { it == PackageManager.PERMISSION_GRANTED }) {
+                GeotagManager.start(applicationContext)
+                toast("Geotagging enabled for future photos")
+            } else {
+                GeotagManager.setEnabled(this, false)
+                toast("Location permission is required for geotagging")
+            }
+            updateGeotagChip()
+            return
+        }
         if (requestCode != WIFI_PERMISSION_REQUEST) return
         val credentials = pendingWifiCredentials
         pendingWifiCredentials = null
@@ -1316,6 +1368,13 @@ class MainActivity : Activity() {
         } else {
             toast("WiFi permission is required to connect to the camera")
         }
+    }
+
+    private fun updateGeotagChip() {
+        if (!::btnGeotag.isInitialized) return
+        val enabled = GeotagManager.isEnabled(this)
+        btnGeotag.text = if (enabled) "Location: on" else "Location: off"
+        highlightValue(btnGeotag, enabled)
     }
 
     /** Android 10+: conexion local aprobada mediante el dialogo seguro del sistema. */
@@ -1523,6 +1582,7 @@ class MainActivity : Activity() {
                 val url = SonyCamera.startLiveview(SonyCamera.cameraEndpoint)
                 if (!isSessionActive(generation)) return
                 refreshChips()
+                startCameraEventListener(generation)
                 streamAndRender(url, generation)
             } catch (e: InterruptedException) {
                 return
@@ -1587,7 +1647,6 @@ class MainActivity : Activity() {
         var lastFrameAt = SystemClock.elapsedRealtime()
         var exposure: Exposure? = null
         var lastMeterAt = 0L
-        var lastCameraStateAt = 0L
         val peakingProcessor = FocusPeakingProcessor()
         var peakingOverlay: Bitmap? = null
         var lastPeakingAt = 0L
@@ -1635,10 +1694,6 @@ class MainActivity : Activity() {
                 }
 
                 val ageMs = SystemClock.elapsedRealtime() - frame.receivedAtMs
-                if (now - lastCameraStateAt >= 1000) {
-                    lastCameraStateAt = now
-                    refreshExposureChips()
-                }
                 if (now - lastWifiSampleAt >= 1000) {
                     lastWifiSampleAt = now
                     sampleWifi()

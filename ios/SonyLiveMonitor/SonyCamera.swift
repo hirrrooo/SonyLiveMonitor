@@ -14,6 +14,8 @@ enum SonyCamera {
 
     private static let idLock = NSLock()
     private static var nextId = 0
+    private static let eventTaskLock = NSLock()
+    private static var eventTask: URLSessionDataTask?
 
     private static let session: URLSession = {
         let config = URLSessionConfiguration.ephemeral
@@ -25,7 +27,8 @@ enum SonyCamera {
     /// Llamada JSON-RPC sincrona: usar siempre fuera del hilo principal.
     @discardableResult
     static func call(_ method: String, params: [Any] = [], endpoint: String = defaultEndpoint,
-                     version: String = "1.0") throws -> [Any] {
+                     version: String = "1.0", timeout: TimeInterval = 10,
+                     eventWait: Bool = false) throws -> [Any] {
         idLock.lock()
         nextId += 1
         let id = nextId
@@ -35,20 +38,31 @@ enum SonyCamera {
         guard let url = URL(string: endpoint) else { throw CameraError("bad endpoint: \(endpoint)") }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        request.timeoutInterval = 10
+        request.timeoutInterval = timeout
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
 
         let semaphore = DispatchSemaphore(value: 0)
         var outcome: Result<Data, Error> = .failure(CameraError("\(method): no response"))
-        session.dataTask(with: request) { data, _, error in
+        let task = session.dataTask(with: request) { data, _, error in
             if let error {
                 outcome = .failure(error)
             } else if let data {
                 outcome = .success(data)
             }
             semaphore.signal()
-        }.resume()
+        }
+        if eventWait {
+            eventTaskLock.lock()
+            eventTask = task
+            eventTaskLock.unlock()
+        }
+        task.resume()
         semaphore.wait()
+        if eventWait {
+            eventTaskLock.lock()
+            if eventTask === task { eventTask = nil }
+            eventTaskLock.unlock()
+        }
 
         let data = try outcome.get()
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -60,6 +74,15 @@ enum SonyCamera {
         if let result = json["result"] as? [Any] { return result }
         if let result = json["results"] as? [Any] { return result }
         throw CameraError("\(method): no result")
+    }
+
+    /// Cancela inmediatamente el long polling al cerrar la sesion.
+    static func cancelEventWait() {
+        eventTaskLock.lock()
+        let task = eventTask
+        eventTask = nil
+        eventTaskLock.unlock()
+        task?.cancel()
     }
 
     /// Informe legible para compartir desde la app: con esto un tester con un

@@ -8,6 +8,7 @@ import java.net.HttpURLConnection
 import java.net.InetAddress
 import java.net.SocketTimeoutException
 import java.net.URL
+import java.util.concurrent.atomic.AtomicInteger
 
 class CameraException(message: String) : Exception(message)
 
@@ -51,22 +52,28 @@ object SonyCamera {
     private const val SSDP_PORT = 1900
     private const val SSDP_ST = "urn:schemas-sony-com:service:ScalarWebAPI:1"
 
-    private var nextId = 0
+    // Las llamadas normales y getEvent(long polling) usan conexiones distintas.
+    // El contador debe ser atomico porque ambas pueden ejecutarse en paralelo.
+    private val nextId = AtomicInteger(0)
+    private val eventConnectionLock = Any()
+    private var eventConnection: HttpURLConnection? = null
 
     fun call(
         endpoint: String, method: String, params: JSONArray = JSONArray(), version: String = "1.0",
+        readTimeoutMs: Int = 10_000, eventWait: Boolean = false,
     ): JSONArray {
         val payload = JSONObject()
             .put("method", method)
             .put("params", params)
-            .put("id", ++nextId)
+            .put("id", nextId.incrementAndGet())
             .put("version", version)
 
         val conn = URL(endpoint).openConnection() as HttpURLConnection
         try {
+            if (eventWait) synchronized(eventConnectionLock) { eventConnection = conn }
             conn.requestMethod = "POST"
             conn.connectTimeout = 5000
-            conn.readTimeout = 10000
+            conn.readTimeout = readTimeoutMs
             conn.doOutput = true
             conn.outputStream.use { it.write(payload.toString().toByteArray()) }
 
@@ -78,7 +85,18 @@ object SonyCamera {
             }
             return json.optJSONArray("result") ?: json.getJSONArray("results")
         } finally {
+            if (eventWait) synchronized(eventConnectionLock) {
+                if (eventConnection === conn) eventConnection = null
+            }
             conn.disconnect()
+        }
+    }
+
+    /** Despierta getEvent(true) al cerrar una sesion o entrar en la galeria. */
+    fun cancelEventWait() {
+        synchronized(eventConnectionLock) {
+            eventConnection?.disconnect()
+            eventConnection = null
         }
     }
 

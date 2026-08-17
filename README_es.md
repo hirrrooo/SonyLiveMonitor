@@ -59,6 +59,15 @@ La vista `Camera card` incluye las fotos tomadas tanto desde la app como con el
 obturador fisico y evita duplicarlas automaticamente en el almacenamiento del
 movil. La descarga de JPEG/ARW es siempre una accion explicita del usuario.
 
+La opcion `Location` de la galeria permite geolocalizar tanto JPEG como Sony
+ARW a resolucion completa. Hay que activarla antes de disparar: la app conserva
+una pista GPS local de 24 horas y, mientras esta conectada, detecta el disparo
+fisico o desde la app para congelar la posicion de ese instante. Cada descarga
+se empareja despues con su hora de captura.
+Solo se modifican los metadatos de la copia descargada; la imagen no se escala
+ni se recomprime y el archivo de la tarjeta permanece intacto. Si no existe una
+ubicacion cercana, la descarga se guarda sin modificar y se muestra un aviso.
+
 Compilar e instalar (con el SDK de Android y un movil con depuracion USB):
 
 ```

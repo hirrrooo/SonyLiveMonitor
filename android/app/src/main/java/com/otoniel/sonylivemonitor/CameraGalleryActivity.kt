@@ -35,6 +35,7 @@ import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import androidx.exifinterface.media.ExifInterface
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -81,6 +82,7 @@ class CameraGalleryActivity : Activity() {
     private lateinit var downloadButton: Button
     private lateinit var deleteButton: Button
     private lateinit var folderButton: Button
+    private lateinit var geotagButton: Button
     private var downloadDialog: Dialog? = null
     private lateinit var downloadImage: ImageView
     private lateinit var downloadTitle: TextView
@@ -111,6 +113,7 @@ class CameraGalleryActivity : Activity() {
     @Suppress("DEPRECATION")
     override fun onStart() {
         super.onStart()
+        GeotagManager.start(applicationContext)
         if (wifiLock?.isHeld == true) return
         val wifi = applicationContext.getSystemService(WifiManager::class.java)
         val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -126,6 +129,7 @@ class CameraGalleryActivity : Activity() {
 
     override fun onStop() {
         super.onStop()
+        GeotagManager.stop()
         wifiLock?.let { if (it.isHeld) it.release() }
         wifiLock = null
     }
@@ -158,6 +162,8 @@ class CameraGalleryActivity : Activity() {
             setOnClickListener { confirmDeleteSelected() }
         }
         folderButton = Button(this).apply { text = "Folder"; setOnClickListener { showFolderOptions() } }
+        geotagButton = Button(this).apply { setOnClickListener { toggleGeotagging() } }
+        updateGeotagLabel()
         more = Button(this).apply {
             text = "Load $PAGE_SIZE more"; visibility = View.GONE
             setOnClickListener { loadNextPage() }
@@ -181,6 +187,7 @@ class CameraGalleryActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             addView(actionRow(selectButton, deleteButton), LinearLayout.LayoutParams(-1, -2))
             addView(actionRow(downloadButton, folderButton), LinearLayout.LayoutParams(-1, -2))
+            addView(actionRow(geotagButton), LinearLayout.LayoutParams(-1, -2))
         }
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL; setBackgroundColor(Color.BLACK)
@@ -641,6 +648,7 @@ class CameraGalleryActivity : Activity() {
 
     private fun downloadOne(job: DownloadJob, position: Int, totalJobs: Int) {
         var conn: HttpURLConnection? = null
+        var temporary: File? = null
         try {
             conn = open(job.original.url)
             val length = conn.contentLengthLong
@@ -652,7 +660,9 @@ class CameraGalleryActivity : Activity() {
                 downloadImage.setImageBitmap(thumbnailCache[job.image.thumbnail])
             }
             val mime = if (job.original.kind == "raw") "image/x-sony-arw" else "image/jpeg"
-            openDestination(job.original.fileName, mime).use { output ->
+            val temp = File.createTempFile("sony-download-", ".${job.original.fileName.substringAfterLast('.', "bin")}", cacheDir)
+            temporary = temp
+            FileOutputStream(temp).use { output ->
                 conn.inputStream.use { input -> copyWithProgress(input, output, length) { percent ->
                     runOnUiThread {
                         downloadProgress.isIndeterminate = false; downloadProgress.progress = percent
@@ -660,15 +670,57 @@ class CameraGalleryActivity : Activity() {
                     }
                 } }
             }
+            val location = if (GeotagManager.isEnabled(this)) GeotagManager.closest(this, job.image.created) else null
+            var geotagFailure: Throwable? = null
+            if (location != null) {
+                runCatching {
+                    if (job.original.kind == "raw") ArwGpsWriter.write(temp, location)
+                    else ExifInterface(temp).apply { setGpsInfo(location); saveAttributes() }
+                }.onFailure { geotagFailure = it }
+            }
+            openDestination(job.original.fileName, mime).use { output ->
+                temp.inputStream().use { input -> input.copyTo(output, 64 * 1024) }
+            }
+            if (GeotagManager.isEnabled(this) && location == null) {
+                runOnUiThread { toast("${job.original.fileName}: no matching location; saved unchanged") }
+            } else if (geotagFailure != null) {
+                runOnUiThread { toast("${job.original.fileName}: geotag failed; saved unchanged") }
+            }
         } catch (e: Exception) {
             toast("${job.original.fileName}: ${e.message}")
         } finally {
             conn?.disconnect()
+            temporary?.delete()
             if (activeDownloads.decrementAndGet() == 0) runOnUiThread {
                 hideDownloadDialog(); busy.visibility = View.GONE
                 status.text = "Downloads finished"
                 toast("Saved to ${destinationDescription()}")
             }
+        }
+    }
+
+    private fun toggleGeotagging() {
+        val enable = !GeotagManager.isEnabled(this)
+        GeotagManager.setEnabled(this, enable)
+        updateGeotagLabel()
+        toast(if (enable) "Geotagging enabled for future photos" else "Geotagging disabled")
+    }
+
+    private fun updateGeotagLabel() {
+        geotagButton.text = if (GeotagManager.isEnabled(this)) "Location: ON" else "Location: OFF"
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == GeotagManager.PERMISSION_REQUEST) {
+            if (grantResults.any { it == PackageManager.PERMISSION_GRANTED }) {
+                GeotagManager.start(applicationContext)
+                toast("Geotagging enabled for future photos")
+            } else {
+                GeotagManager.setEnabled(this, false)
+                toast("Location permission is required for geotagging")
+            }
+            updateGeotagLabel()
         }
     }
 

@@ -78,6 +78,13 @@ the reference if something fails.
   viewer with pinch-zoom and swipe between shots.
 - **Download JPEG or RAW/ARW** with multi-select, a progress dialog and a
   choosable destination folder. Always an explicit action.
+- **Optional phone GPS geotagging for full-resolution JPEG and Sony ARW.** Enable
+  `Location` before shooting. While connected, Sony camera events freeze the
+  latest phone position at the instant of a physical or in-app shutter release;
+  downloaded files are then matched by capture time and receive standard GPS
+  metadata without resizing or recompressing image data.
+  Files on the camera card are never modified, and a download is left unchanged
+  when no recent location matches it.
 - **Delete from the card** with a second confirmation, where the camera reports
   API support.
 - **Automatic reconnection**, including re-binding to the active Wi-Fi.

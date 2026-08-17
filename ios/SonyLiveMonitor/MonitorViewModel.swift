@@ -139,6 +139,7 @@ final class MonitorViewModel: ObservableObject {
     @Published var movieRecording = false
     @Published var showConnectHelp = false
     @Published var showGallery = false
+    @Published var geotagEnabled: Bool
     // Salud del enlace con la camara. iOS no expone el RSSI del WiFi, asi que
     // se estima del transporte real: huecos entre frames (jitter) + drops. Es
     // el sintoma directo de mala red, que es lo que importa para diagnosticar.
@@ -147,6 +148,7 @@ final class MonitorViewModel: ObservableObject {
     @Published var diagnosticsReport: String?  // no-nil mientras se muestra la hoja
 
     private let apiQueue = DispatchQueue(label: "camera-api")
+    private let eventQueue = DispatchQueue(label: "camera-events")
     private let defaults = UserDefaults.standard
 
     // Una generacion identifica cada sesion. Un hilo antiguo nunca puede
@@ -167,6 +169,11 @@ final class MonitorViewModel: ObservableObject {
     private var zoomTextGeneration = 0
     private var focusGeneration = 0
     private var toastGeneration = 0
+    private let cameraEventLock = NSLock()
+    private var eventListenerRunning = false
+    private var lastCameraStatus: String?
+    private var appCapturePendingAt: Date?
+    private var evStepIndex = 1
 
     // Como maximo puede haber una actualizacion de video esperando en main.
     // Sin esta coalescencia, una bajada puntual de rendimiento acumula un
@@ -174,8 +181,6 @@ final class MonitorViewModel: ObservableObject {
     private let framePublishLock = NSLock()
     private var framePublishScheduled = false
     private var pendingFramePublish: (UIImage?, UIImage?, Exposure?, String?, String)?
-    private let exposureRefreshLock = NSLock()
-    private var exposureRefreshPending = false
 
     init() {
         rotation = defaults.integer(forKey: "rot")
@@ -190,6 +195,7 @@ final class MonitorViewModel: ObservableObject {
                 : defaults.integer(forKey: "peakingSensitivity")
         ) ?? .medium
         hudOn = defaults.object(forKey: "hud") == nil ? true : defaults.bool(forKey: "hud")
+        geotagEnabled = GeotagManager.shared.enabled
         meterOnStorage = meterOn
         peakingColorStorage = peakingColor
         peakingSensitivityStorage = peakingSensitivity
@@ -210,6 +216,8 @@ final class MonitorViewModel: ObservableObject {
 
     func start() {
         guard !showGallery else { return }
+        geotagEnabled = GeotagManager.shared.enabled
+        GeotagManager.shared.startIfEnabled()
 
         lifecycleLock.lock()
         guard !sessionActive else { lifecycleLock.unlock(); return }
@@ -227,6 +235,7 @@ final class MonitorViewModel: ObservableObject {
     }
 
     func stop() {
+        GeotagManager.shared.stop()
         lifecycleLock.lock()
         sessionActive = false
         sessionGeneration &+= 1
@@ -239,6 +248,7 @@ final class MonitorViewModel: ObservableObject {
         // Cerrar el socket despierta inmediatamente awaitFrame/read; no dejamos
         // que una sesion anterior sobreviva hasta el siguiente start().
         stream?.stop()
+        SonyCamera.cancelEventWait()
         UIApplication.shared.isIdleTimerDisabled = false
 
         framePublishLock.lock()
@@ -249,10 +259,22 @@ final class MonitorViewModel: ObservableObject {
         exposure = nil
     }
 
+    func toggleGeotagging() {
+        geotagEnabled.toggle()
+        GeotagManager.shared.setEnabled(geotagEnabled)
+        showToast(geotagEnabled ? "Geotagging enabled for future photos" : "Geotagging disabled")
+    }
+
     private func isSessionActive(_ generation: Int) -> Bool {
         lifecycleLock.lock()
         defer { lifecycleLock.unlock() }
         return sessionActive && sessionGeneration == generation
+    }
+
+    private func activeSessionGeneration() -> Int? {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        return sessionActive ? sessionGeneration : nil
     }
 
     private func registerStream(_ stream: LiveviewStream, generation: Int) -> Bool {
@@ -350,6 +372,7 @@ final class MonitorViewModel: ObservableObject {
                     let url = try SonyCamera.startLiveview()
                     guard isSessionActive(generation) else { return }
                     refreshChips()
+                    startCameraEventListener(generation: generation)
                     streamAndRender(url: url, generation: generation)
                 } catch {
                     guard isSessionActive(generation) else { return }
@@ -387,7 +410,6 @@ final class MonitorViewModel: ObservableObject {
         var fpsWindowCount = 0
         var lastFrameAt = fpsWindowStart
         var lastMeterAt: TimeInterval = 0
-        var lastCameraStateAt: TimeInterval = 0
         var lastPeakingAt: TimeInterval = 0
         var peakingOverlay: UIImage?
         var meterExposure: Exposure?
@@ -444,11 +466,6 @@ final class MonitorViewModel: ObservableObject {
                 }
 
                 let ageMs = Int((ProcessInfo.processInfo.systemUptime - frame.receivedAt) * 1000)
-
-                if now - lastCameraStateAt >= 1 {
-                    lastCameraStateAt = now
-                    refreshExposureChips()
-                }
 
                 let settings = renderSettings()
                 // El analisis de exposicion es barato pero 7 muestras/s bastan.
@@ -713,36 +730,6 @@ final class MonitorViewModel: ObservableObject {
                 if movement == "start" { self.showToast("Zoom: requires a power zoom lens") }
             }
         }
-        pollZoomPosition()
-        if movement == "stop" {
-            // El motor sigue frenando un instante: leer tambien la posicion final
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { self.pollZoomPosition() }
-        }
-    }
-
-    /// Lee la posicion de zoom via getEvent. La API solo da porcentaje 0-100;
-    /// los mm se estiman mapeando al rango 16-50 del PZ del kit.
-    private func pollZoomPosition() {
-        apiQueue.async {
-            guard let r = try? SonyCamera.call("getEvent", params: [false]) else { return }
-            for item in r {
-                guard let object = item as? [String: Any],
-                      let pct = (object["zoomPosition"] as? NSNumber)?.intValue else { continue }
-                // Progresion geometrica: los zoom motorizados avanzan a ratio
-                // constante, no a mm constantes (16-50 PZ)
-                let mm = 16.0 * pow(50.0 / 16.0, Double(pct) / 100.0)
-                let text = String(format: "Zoom %d%%  ~%.0f mm", pct, mm)
-                DispatchQueue.main.async {
-                    self.zoomText = text
-                    self.zoomTextGeneration += 1
-                    let generation = self.zoomTextGeneration
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
-                        if self.zoomTextGeneration == generation { self.zoomText = nil }
-                    }
-                }
-                break
-            }
-        }
     }
 
     func takePicture() {
@@ -761,6 +748,10 @@ final class MonitorViewModel: ObservableObject {
             return
         }
         setCapturing(true)
+        cameraEventLock.lock()
+        appCapturePendingAt = Date()
+        cameraEventLock.unlock()
+        GeotagManager.shared.recordCapture()
         apiQueue.async {
             defer { self.setCapturing(false) }
             do {
@@ -768,6 +759,9 @@ final class MonitorViewModel: ObservableObject {
                 self.showToast("Photo taken")
                 self.refreshChips()  // los valores pueden cambiar tras el disparo (p.ej. ISO auto)
             } catch {
+                self.cameraEventLock.lock()
+                self.appCapturePendingAt = nil
+                self.cameraEventLock.unlock()
                 self.showToast("Shutter: \(error.localizedDescription)")
             }
         }
@@ -800,24 +794,6 @@ final class MonitorViewModel: ObservableObject {
                 }
             }
 
-            // getEvent es la instantanea de estado de la API de Sony. En
-            // algunas camaras los getAvailable* solo devuelven un valor util
-            // despues de haber cambiado el ajuste desde el remoto.
-            if let events = try? SonyCamera.call("getEvent", params: [false], version: "1.1") {
-                for case let event as [String: Any] in events {
-                    let keys = [
-                        "ISO": "currentIsoSpeedRate",
-                        "Shutter": "currentShutterSpeed",
-                        "Aperture": "currentFNumber",
-                        "Focus": "currentFocusMode",
-                        "Flash": "currentFlashMode",
-                        "Timer": "currentSelfTimer",
-                    ]
-                    for (id, key) in keys where currentById[id] == nil {
-                        if let value = event[key] { currentById[id] = Self.stringify(value) }
-                    }
-                }
-            }
             for setting in Self.settings {
                 if currentById[setting.id] == nil,
                    let r = try? SonyCamera.call(setting.getMethod), let current = r.first {
@@ -831,6 +807,7 @@ final class MonitorViewModel: ObservableObject {
             if let r = try? SonyCamera.call("getAvailableExposureCompensation"), r.count >= 4,
                let cur = (r[0] as? NSNumber)?.intValue,
                let stepIndex = (r[3] as? NSNumber)?.intValue {
+                self.evStepIndex = stepIndex
                 let stepEv = stepIndex == 2 ? 0.5 : 1.0 / 3.0
                 let label = String(format: "%+.1f EV", Double(cur) * stepEv)
                 DispatchQueue.main.async { self.chipLabels["EV"] = label }
@@ -848,53 +825,130 @@ final class MonitorViewModel: ObservableObject {
         }
     }
 
-    /// Sincroniza los tres valores que tambien pueden cambiar desde los
-    /// controles fisicos. Solo permite una lectura pendiente para no formar
-    /// cola si la camara tarda en responder.
-    private func refreshExposureChips() {
-        exposureRefreshLock.lock()
-        guard !exposureRefreshPending else { exposureRefreshLock.unlock(); return }
-        exposureRefreshPending = true
-        exposureRefreshLock.unlock()
+    /// Un unico long polling recibe cambios hechos desde el movil o directamente
+    /// en la camara sin consultar el estado una vez por segundo.
+    private func startCameraEventListener(generation: Int) {
+        cameraEventLock.lock()
+        guard !eventListenerRunning else { cameraEventLock.unlock(); return }
+        eventListenerRunning = true
+        lastCameraStatus = nil
+        cameraEventLock.unlock()
 
-        apiQueue.async {
+        eventQueue.async {
+            var version = "1.1"
             defer {
-                self.exposureRefreshLock.lock()
-                self.exposureRefreshPending = false
-                self.exposureRefreshLock.unlock()
-            }
-
-            let exposureSettings = Self.settings.filter {
-                $0.id == "ISO" || $0.id == "Shutter" || $0.id == "Aperture"
-            }
-            var values: [String: String] = [:]
-
-            if let events = try? SonyCamera.call("getEvent", params: [false], version: "1.1") {
-                let keys = ["ISO": "currentIsoSpeedRate",
-                            "Shutter": "currentShutterSpeed",
-                            "Aperture": "currentFNumber"]
-                for case let event as [String: Any] in events {
-                    for (id, key) in keys where values[id] == nil {
-                        if let value = event[key] { values[id] = Self.stringify(value) }
-                    }
+                self.cameraEventLock.lock()
+                self.eventListenerRunning = false
+                self.cameraEventLock.unlock()
+                if let activeGeneration = self.activeSessionGeneration() {
+                    self.startCameraEventListener(generation: activeGeneration)
                 }
             }
-
-            for setting in exposureSettings where values[setting.id] == nil {
-                if let r = try? SonyCamera.call(setting.currentMethod), let current = r.first {
-                    values[setting.id] = Self.stringify(current)
-                } else if let r = try? SonyCamera.call(setting.getMethod), let current = r.first {
-                    values[setting.id] = Self.stringify(current)
+            while self.isSessionActive(generation) {
+                do {
+                    let result = try SonyCamera.call("getEvent", params: [true], version: version,
+                                                     timeout: 65, eventWait: true)
+                    if self.isSessionActive(generation) { self.handleCameraEvents(result) }
+                } catch {
+                    guard self.isSessionActive(generation) else { return }
+                    if version == "1.1" { version = "1.0" }
+                    else { Thread.sleep(forTimeInterval: 0.5) }
                 }
-            }
-
-            let labels = Dictionary(uniqueKeysWithValues: exposureSettings.compactMap { setting in
-                values[setting.id].map { (setting.id, setting.chipLabel($0)) }
-            })
-            if !labels.isEmpty {
-                DispatchQueue.main.async { self.chipLabels.merge(labels) { _, new in new } }
             }
         }
+    }
+
+    private func eventObjects(_ value: Any) -> [[String: Any]] {
+        if let object = value as? [String: Any] { return [object] }
+        if let array = value as? [Any] { return array.flatMap { eventObjects($0) } }
+        return []
+    }
+
+    private func handleCameraEvents(_ result: [Any]) {
+        let objects = eventObjects(result)
+        let keys = [
+            "currentIsoSpeedRate": "ISO",
+            "currentShutterSpeed": "Shutter",
+            "currentFNumber": "Aperture",
+            "currentFocusMode": "Focus",
+            "currentFlashMode": "Flash",
+            "currentSelfTimer": "Timer",
+        ]
+        var labels: [String: String] = [:]
+        var zoomPosition: Int?
+        var newShootMode: String?
+
+        for event in objects {
+            if let status = event["cameraStatus"] as? String { handleCameraStatus(status) }
+            for (key, id) in keys {
+                guard let value = event[key],
+                      let setting = Self.settings.first(where: { $0.id == id }) else { continue }
+                labels[id] = setting.chipLabel(Self.stringify(value))
+            }
+            if let current = (event["currentExposureCompensation"] as? NSNumber)?.intValue {
+                if let step = (event["stepIndexOfExposureCompensation"] as? NSNumber)?.intValue {
+                    evStepIndex = step
+                }
+                let step = evStepIndex == 2 ? 0.5 : 1.0 / 3.0
+                labels["EV"] = String(format: "%+.1f EV", Double(current) * step)
+            }
+            if let wb = event["currentWhiteBalanceMode"] as? String {
+                labels["WB"] = "WB \(Self.trimWbSuffix(wb))"
+            }
+            if let mode = event["currentShootMode"] as? String {
+                newShootMode = mode
+                labels["MODE"] = mode == "movie" ? "Mode: Video" : "Mode: Photo"
+            }
+            if let pct = (event["zoomPosition"] as? NSNumber)?.intValue { zoomPosition = pct }
+        }
+
+        if !labels.isEmpty || newShootMode != nil {
+            DispatchQueue.main.async {
+                self.chipLabels.merge(labels) { _, new in new }
+                if let mode = newShootMode { self.shootMode = mode }
+            }
+        }
+        if let pct = zoomPosition {
+            let mm = 16.0 * pow(50.0 / 16.0, Double(pct) / 100.0)
+            let text = String(format: "Zoom %d%%  ~%.0f mm", pct, mm)
+            DispatchQueue.main.async {
+                self.zoomText = text
+                self.zoomTextGeneration += 1
+                let generation = self.zoomTextGeneration
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+                    if self.zoomTextGeneration == generation { self.zoomText = nil }
+                }
+            }
+        }
+    }
+
+    private func handleCameraStatus(_ status: String) {
+        var recordPhysicalCapture = false
+        cameraEventLock.lock()
+        let previous = lastCameraStatus
+        if status != previous {
+            let wasCapturing = previous == "StillCapturing" || previous == "StillSaving"
+            switch status {
+            case "StillCapturing", "StillSaving":
+                setCapturing(true)
+                if !wasCapturing {
+                    let pending = appCapturePendingAt.map {
+                        let age = Date().timeIntervalSince($0)
+                        return age >= 0 && age <= 30
+                    } ?? false
+                    if pending { appCapturePendingAt = nil }
+                    else { recordPhysicalCapture = true }
+                }
+            case "IDLE":
+                setCapturing(false)
+                if wasCapturing { appCapturePendingAt = nil }
+            default:
+                break
+            }
+            lastCameraStatus = status
+        }
+        cameraEventLock.unlock()
+        if recordPhysicalCapture { GeotagManager.shared.recordCapture() }
     }
 
     private static func trimWbSuffix(_ mode: String) -> String {

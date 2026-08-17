@@ -347,6 +347,8 @@ struct ControlPanel: View {
                 default:
                     ChipButton(label: "WiFi") { model.showConnectHelp = true }
                     ChipButton(label: "Camera card") { model.openGallery() }
+                    ChipButton(label: "Location: \(model.geotagEnabled ? "on" : "off")",
+                               active: model.geotagEnabled) { model.toggleGeotagging() }
                     ChipButton(label: "Diagnostics") { model.runDiagnostics() }
                 }
             }
