@@ -97,6 +97,11 @@ struct ValueStrip {
     let apply: (String) -> Void  // llamar desde el hilo principal
 }
 
+enum VideoSource: Int {
+    case wifi, hdmi
+    var label: String { self == .hdmi ? "HDMI" : "WiFi" }
+}
+
 final class MonitorViewModel: ObservableObject {
 
     static let settings: [CameraSetting] = [
@@ -108,6 +113,8 @@ final class MonitorViewModel: ObservableObject {
                       chipLabel: { "f/\($0)" }),
         CameraSetting(id: "Focus", getMethod: "getAvailableFocusMode", setMethod: "setFocusMode",
                       chipLabel: { $0 }),
+        CameraSetting(id: "Drive", getMethod: "getAvailableContShootingMode", setMethod: "setContShootingMode",
+                      chipLabel: { "Drive \($0)" }),
         CameraSetting(id: "Flash", getMethod: "getAvailableFlashMode", setMethod: "setFlashMode",
                       chipLabel: { "Flash \($0)" }),
         CameraSetting(id: "Timer", getMethod: "getAvailableSelfTimer", setMethod: "setSelfTimer",
@@ -135,6 +142,7 @@ final class MonitorViewModel: ObservableObject {
     @Published var peakingColor: PeakingColor
     @Published var peakingSensitivity: PeakingSensitivity
     @Published var hudOn: Bool
+    @Published var videoSource: VideoSource
     @Published var shootMode = "still"
     @Published var movieRecording = false
     @Published var showConnectHelp = false
@@ -157,6 +165,7 @@ final class MonitorViewModel: ObservableObject {
     private var sessionActive = false
     private var sessionGeneration = 0
     private var currentStream: LiveviewStream?
+    private var currentExternalStream: ExternalCameraStream?
     private var worker: Thread?
 
     // Copia sincronizada del pequeno subconjunto de estado que consume el hilo
@@ -168,6 +177,7 @@ final class MonitorViewModel: ObservableObject {
     private var capturingStorage = false
     private var zoomTextGeneration = 0
     private var focusGeneration = 0
+    private var touchFocusActive = false
     private var toastGeneration = 0
     private let cameraEventLock = NSLock()
     private var eventListenerRunning = false
@@ -195,6 +205,8 @@ final class MonitorViewModel: ObservableObject {
                 : defaults.integer(forKey: "peakingSensitivity")
         ) ?? .medium
         hudOn = defaults.object(forKey: "hud") == nil ? true : defaults.bool(forKey: "hud")
+        videoSource = VideoSource(rawValue: defaults.integer(forKey: "videoSource")) ?? .wifi
+        if UIDevice.current.userInterfaceIdiom != .pad { videoSource = .wifi }
         geotagEnabled = GeotagManager.shared.enabled
         meterOnStorage = meterOn
         peakingColorStorage = peakingColor
@@ -240,7 +252,9 @@ final class MonitorViewModel: ObservableObject {
         sessionActive = false
         sessionGeneration &+= 1
         let stream = currentStream
+        let external = currentExternalStream
         currentStream = nil
+        currentExternalStream = nil
         worker?.cancel()
         worker = nil
         lifecycleLock.unlock()
@@ -248,6 +262,7 @@ final class MonitorViewModel: ObservableObject {
         // Cerrar el socket despierta inmediatamente awaitFrame/read; no dejamos
         // que una sesion anterior sobreviva hasta el siguiente start().
         stream?.stop()
+        external?.stop()
         SonyCamera.cancelEventWait()
         UIApplication.shared.isIdleTimerDisabled = false
 
@@ -263,6 +278,17 @@ final class MonitorViewModel: ObservableObject {
         geotagEnabled.toggle()
         GeotagManager.shared.setEnabled(geotagEnabled)
         showToast(geotagEnabled ? "Geotagging enabled for future photos" : "Geotagging disabled")
+    }
+
+    func toggleVideoSource() {
+        if videoSource == .wifi && UIDevice.current.userInterfaceIdiom != .pad {
+            showToast("HDMI/UVC is available only on iPad")
+            return
+        }
+        stop()
+        videoSource = videoSource == .wifi ? .hdmi : .wifi
+        defaults.set(videoSource.rawValue, forKey: "videoSource")
+        start()
     }
 
     private func isSessionActive(_ generation: Int) -> Bool {
@@ -288,6 +314,20 @@ final class MonitorViewModel: ObservableObject {
     private func clearStream(_ stream: LiveviewStream) {
         lifecycleLock.lock()
         if currentStream === stream { currentStream = nil }
+        lifecycleLock.unlock()
+    }
+
+    private func registerExternalStream(_ stream: ExternalCameraStream, generation: Int) -> Bool {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        guard sessionActive, sessionGeneration == generation else { return false }
+        currentExternalStream = stream
+        return true
+    }
+
+    private func clearExternalStream(_ stream: ExternalCameraStream) {
+        lifecycleLock.lock()
+        if currentExternalStream === stream { currentExternalStream = nil }
         lifecycleLock.unlock()
     }
 
@@ -368,6 +408,11 @@ final class MonitorViewModel: ObservableObject {
             // reintentos. Esta piscina exterior se vacia en cada vuelta.
             autoreleasepool {
                 do {
+                    if videoSource == .hdmi {
+                        publishMessage("Waiting for an HDMI/UVC capture device...")
+                        try streamExternalAndRender(generation: generation)
+                        return
+                    }
                     publishMessage("Connecting to the camera...")
                     let url = try SonyCamera.startLiveview()
                     guard isSessionActive(generation) else { return }
@@ -389,6 +434,95 @@ final class MonitorViewModel: ObservableObject {
                     publishMessage(message)
                     Thread.sleep(forTimeInterval: 2)
                 }
+            }
+        }
+    }
+
+    /// HDMI proporciona la imagen; la API Sony por WiFi sigue alimentando los
+    /// controles, el disparador, los eventos y la galeria cuando esta disponible.
+    private func connectControlsForHdmi(generation: Int) {
+        apiQueue.async {
+            guard self.isSessionActive(generation) else { return }
+            if (try? SonyCamera.call("getVersions")) != nil {
+                self.refreshChips()
+                self.startCameraEventListener(generation: generation)
+            } else {
+                self.apiQueue.asyncAfter(deadline: .now() + 3) {
+                    self.connectControlsForHdmi(generation: generation)
+                }
+            }
+        }
+    }
+
+    private func streamExternalAndRender(generation: Int) throws {
+        let stream = ExternalCameraStream()
+        try stream.start()
+        guard registerExternalStream(stream, generation: generation) else {
+            stream.stop()
+            return
+        }
+        connectControlsForHdmi(generation: generation)
+        defer {
+            stream.stop()
+            clearExternalStream(stream)
+        }
+
+        DispatchQueue.main.async {
+            self.linkText = "video: HDMI/UVC"
+            self.linkQuality = 1
+        }
+
+        var fps: Float = 0
+        var fpsWindowStart = ProcessInfo.processInfo.systemUptime
+        var fpsWindowCount = 0
+        var lastFrameAt = fpsWindowStart
+        var lastMeterAt: TimeInterval = 0
+        var lastPeakingAt: TimeInterval = 0
+        var peakingOverlay: UIImage?
+        var meterExposure: Exposure?
+        let peakingProcessor = FocusPeakingProcessor()
+
+        while isSessionActive(generation), videoSource == .hdmi {
+            let frame = stream.awaitFrame(timeout: 0.25)
+            let now = ProcessInfo.processInfo.systemUptime
+            guard let frame else {
+                if now - lastFrameAt > 1.2 {
+                    publishFrame(nil, alert: stream.status, fps: fps, ageMs: -1,
+                                 dropped: stream.framesDropped)
+                }
+                continue
+            }
+
+            autoreleasepool {
+                fpsWindowCount += 1
+                lastFrameAt = now
+                if now - fpsWindowStart >= 1 {
+                    fps = Float(fpsWindowCount) / Float(now - fpsWindowStart)
+                    fpsWindowStart = now
+                    fpsWindowCount = 0
+                }
+
+                let settings = renderSettings()
+                if !settings.meter {
+                    meterExposure = nil
+                } else if now - lastMeterAt >= 0.15, let cg = frame.image.cgImage {
+                    lastMeterAt = now
+                    meterExposure = ExposureMeter.compute(cg)
+                }
+
+                if settings.color == .off {
+                    peakingOverlay = nil
+                } else if now - lastPeakingAt >= 0.12, let cg = frame.image.cgImage {
+                    lastPeakingAt = now
+                    peakingOverlay = peakingProcessor.compute(
+                        cg, color: settings.color, sensitivity: settings.sensitivity
+                    )
+                }
+
+                let ageMs = Int((ProcessInfo.processInfo.systemUptime - frame.receivedAt) * 1000)
+                publishFrame(frame.image, peaking: peakingOverlay, exposure: meterExposure,
+                             alert: nil, fps: fps, ageMs: ageMs,
+                             dropped: stream.framesDropped)
             }
         }
     }
@@ -574,7 +708,8 @@ final class MonitorViewModel: ObservableObject {
     private func applySetting(_ method: String, value: Any, onOK: @escaping () -> Void) {
         apiQueue.async {
             do {
-                try SonyCamera.call(method, params: [value])
+                self.cancelTouchFocusBeforeSetting()
+                try self.callSettingWhenAvailable(method, params: [value])
                 DispatchQueue.main.async(execute: onOK)
             } catch {
                 self.showToast("Error: \(error.localizedDescription)")
@@ -582,9 +717,39 @@ final class MonitorViewModel: ObservableObject {
         }
     }
 
+    /// Sony bloquea temporalmente ISO, WB, modo, etc. mientras sigue activo el
+    /// enfoque tactil. Se cancela antes de cambiar un ajuste y se tolera el breve
+    /// estado de transicion que algunos modelos notifican como error 1.
+    private func cancelTouchFocusBeforeSetting() {
+        guard touchFocusActive else { return }
+        _ = try? callSettingWhenAvailable("cancelTouchAFPosition")
+        touchFocusActive = false
+    }
+
+    @discardableResult
+    private func callSettingWhenAvailable(_ method: String, params: [Any] = []) throws -> [Any] {
+        let delays: [TimeInterval] = [0.15, 0.3, 0.6]
+        for attempt in 0...delays.count {
+            do {
+                return try SonyCamera.call(method, params: params)
+            } catch {
+                let temporarilyBusy = error.localizedDescription.localizedCaseInsensitiveContains(
+                    "[1] Not Available Now"
+                )
+                guard temporarilyBusy, attempt < delays.count else { throw error }
+                Thread.sleep(forTimeInterval: delays[attempt])
+            }
+        }
+        throw CameraError("\(method) failed")
+    }
+
     /// Abre/cierra la tira de valores de un ajuste. Cada valor se aplica al
     /// instante y la tira permanece abierta para seguir ajustando.
     func toggleStrip(for setting: CameraSetting) {
+        if setting.id == "Drive" {
+            toggleDriveStrip(for: setting)
+            return
+        }
         if strip?.owner == setting.id { strip = nil; return }
         strip = ValueStrip(owner: setting.id, values: [], current: nil, apply: { _ in })
         apiQueue.async {
@@ -668,10 +833,12 @@ final class MonitorViewModel: ObservableObject {
                     self.strip = ValueStrip(owner: "WB", values: modes, current: current) { mode in
                         self.apiQueue.async {
                             do {
+                                self.cancelTouchFocusBeforeSetting()
                                 // Para "Color Temperature" hace falta un kelvin: 5500 por defecto
                                 let temp = mode == "Color Temperature"
-                                try SonyCamera.call("setWhiteBalance",
-                                                    params: [mode, temp, temp ? 5500 : 0])
+                                try self.callSettingWhenAvailable(
+                                    "setWhiteBalance", params: [mode, temp, temp ? 5500 : 0]
+                                )
                                 DispatchQueue.main.async {
                                     self.chipLabels["WB"] = "WB \(Self.trimWbSuffix(mode))"
                                     if self.strip?.owner == "WB" { self.strip?.current = mode }
@@ -732,6 +899,46 @@ final class MonitorViewModel: ObservableObject {
         }
     }
 
+    /// El grupo Continuous shooting de Sony usa un objeto para leer y escribir,
+    /// no el formato posicional simple del resto de ajustes.
+    private func toggleDriveStrip(for setting: CameraSetting) {
+        if strip?.owner == setting.id { strip = nil; return }
+        strip = ValueStrip(owner: setting.id, values: [], current: nil, apply: { _ in })
+        apiQueue.async {
+            if self.shootMode == "movie" {
+                self.showToast("Drive: available only in Photo mode")
+                DispatchQueue.main.async { if self.strip?.owner == setting.id { self.strip = nil } }
+                return
+            }
+            do {
+                // No bloquear por getAvailableApiList: una app Sony parcheada
+                // puede aceptar comandos que no declara en esa lista.
+                let result = try SonyCamera.call(setting.getMethod)
+                guard let state = result.first as? [String: Any],
+                      let current = state["contShootingMode"] as? String,
+                      let values = state["candidate"] as? [String], !values.isEmpty else {
+                    throw CameraError("unexpected response")
+                }
+                DispatchQueue.main.async {
+                    guard self.strip?.owner == setting.id else { return }
+                    self.strip = ValueStrip(owner: setting.id, values: values, current: current) { value in
+                        self.applySetting(setting.setMethod,
+                                          value: ["contShootingMode": value]) {
+                            self.chipLabels[setting.id] = setting.chipLabel(value)
+                            if self.strip?.owner == setting.id { self.strip?.current = value }
+                        }
+                    }
+                }
+            } catch {
+                let unavailable = error.localizedDescription.localizedCaseInsensitiveContains("Not Available Now")
+                self.showToast(unavailable
+                    ? "Drive: not available in the camera's current mode or state"
+                    : "Drive: \(error.localizedDescription)")
+                DispatchQueue.main.async { if self.strip?.owner == setting.id { self.strip = nil } }
+            }
+        }
+    }
+
     func takePicture() {
         if shootMode == "movie" {
             // En modo video el disparador inicia/detiene la grabacion
@@ -778,7 +985,9 @@ final class MonitorViewModel: ObservableObject {
         apiQueue.async {
             do {
                 try SonyCamera.call("setTouchAFPosition", params: [xPct, yPct])
+                self.touchFocusActive = true
             } catch {
+                self.touchFocusActive = false
                 self.showToast("Focus: \(error.localizedDescription)")
             }
         }
@@ -790,7 +999,12 @@ final class MonitorViewModel: ObservableObject {
             var currentById: [String: String] = [:]
             for setting in Self.settings {
                 if let result = try? SonyCamera.call(setting.currentMethod), let current = result.first {
-                    currentById[setting.id] = Self.stringify(current)
+                    if setting.id == "Drive", let state = current as? [String: Any],
+                       let mode = state["contShootingMode"] as? String {
+                        currentById[setting.id] = mode
+                    } else {
+                        currentById[setting.id] = Self.stringify(current)
+                    }
                 }
             }
 
@@ -871,6 +1085,7 @@ final class MonitorViewModel: ObservableObject {
             "currentShutterSpeed": "Shutter",
             "currentFNumber": "Aperture",
             "currentFocusMode": "Focus",
+            "currentContShootingMode": "Drive",
             "currentFlashMode": "Flash",
             "currentSelfTimer": "Timer",
         ]

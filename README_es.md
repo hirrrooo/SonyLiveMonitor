@@ -36,13 +36,18 @@ Componentes:
 ## App Android ("Sony Live Monitor")
 
 - Liveview a pantalla completa con HUD (fps, edad del frame, drops).
+- Monitor HDMI por cable opcional en Android USB-OTG y iPad con USB-C: conecta
+  la salida Micro-HDMI tipo D mediante una capturadora HDMI-UVC y selecciona
+  `App > Video: HDMI`. La WiFi puede mantenerse para controlar la camara.
 - Cuadriculas configurables: tercios / tercios+diagonales / cruz (persistente).
 - Medidor de exposicion en tiempo real calculado del liveview: histograma de
   luminancia, desviacion EV respecto al gris medio y % de recorte
   (la API de Sony no expone el fotometro interno de la camara).
-- Controles de camara: ISO, velocidad, apertura, compensacion EV y disparo
-  (los valores disponibles se consultan a la camara segun el modo del dial).
-- Enfoque tactil tocando la imagen (setTouchAFPosition).
+- Controles de camara: ISO, velocidad, apertura, compensacion EV, balance de
+  blancos, modo Drive, flash, temporizador y disparo. La a6000 no expone el
+  cambio remoto a rafaga/Drive y la app muestra esta limitacion claramente.
+- Enfoque tactil tocando la imagen (`setTouchAFPosition`) cuando la camara lo
+  permite; la a6000 no lo ofrece durante la grabacion de video.
 - Focus peaking calculado en el movil, con color y sensibilidad configurables
   (tambien funciona con objetivos manuales sin comunicacion electronica).
 - Vista espejo horizontal para grabarse mirando el monitor; solo transforma la
@@ -58,6 +63,18 @@ Componentes:
 La vista `Camera card` incluye las fotos tomadas tanto desde la app como con el
 obturador fisico y evita duplicarlas automaticamente en el almacenamiento del
 movil. La descarga de JPEG/ARW es siempre una accion explicita del usuario.
+
+### Conexion mediante capturadora HDMI
+
+El puerto Multi/Micro-USB de la camara no transporta video. La conexion correcta es:
+
+`Micro-HDMI tipo D de la camara -> cable HDMI -> capturadora UVC -> USB-C/OTG`
+
+Para obtener imagen limpia, configura `HDMI Info. Display` en `Off`. Se recomienda
+empezar con salida 1080p por compatibilidad. En Android hace falta soporte USB
+host/OTG. En Apple requiere un iPad con USB-C y iPadOS 17 o posterior; iPhone no
+es compatible. HDMI aporta la imagen, mientras la WiFi sigue siendo necesaria
+para ISO, enfoque, disparo y galeria.
 
 La opcion `Location` de la galeria permite geolocalizar tanto JPEG como Sony
 ARW a resolucion completa. Hay que activarla antes de disparar: la app conserva

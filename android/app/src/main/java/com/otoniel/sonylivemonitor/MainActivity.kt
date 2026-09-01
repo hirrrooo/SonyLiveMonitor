@@ -53,9 +53,11 @@ class MainActivity : Activity() {
 
     companion object {
         private const val WIFI_PERMISSION_REQUEST = 1001
+        private const val CAMERA_PERMISSION_REQUEST = 1002
     }
 
     private enum class Grid { OFF, TERCIOS, TERCIOS_DIAG, CRUZ }
+    private enum class VideoSource { WIFI, HDMI }
 
     private enum class PeakingColor(val label: String, val argb: Int) {
         OFF("off", Color.TRANSPARENT),
@@ -90,11 +92,13 @@ class MainActivity : Activity() {
         Setting("Shutter", "getAvailableShutterSpeed", "setShutterSpeed") { it },
         Setting("Aperture", "getAvailableFNumber", "setFNumber") { "f/$it" },
         Setting("Focus", "getAvailableFocusMode", "setFocusMode") { it },
+        Setting("Drive", "getAvailableContShootingMode", "setContShootingMode") { "Drive $it" },
         Setting("Flash", "getAvailableFlashMode", "setFlashMode") { "Flash $it" },
         Setting("Timer", "getAvailableSelfTimer", "setSelfTimer", numeric = true) { "T:${it}s" },
     )
 
     private lateinit var surface: SurfaceView
+    private lateinit var uvcPreviewSink: SurfaceView
     private lateinit var connectivity: ConnectivityManager
     private val apiExecutor = Executors.newSingleThreadExecutor()
     private val eventExecutor = Executors.newSingleThreadExecutor()
@@ -108,6 +112,7 @@ class MainActivity : Activity() {
     private val lifecycleLock = Any()
     private val sessionGeneration = AtomicInteger(0)
     private var currentStream: LiveviewStream? = null
+    private var currentUvcSource: UvcVideoSource? = null
     private var worker: Thread? = null
     private var wifiLock: WifiManager.WifiLock? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
@@ -126,6 +131,8 @@ class MainActivity : Activity() {
     @Volatile private var lastFitRect = RectF()
     @Volatile private var focusMarker: Pair<Float, Float>? = null
     @Volatile private var focusMarkerUntil = 0L
+    @Volatile private var touchFocusActive = false
+    @Volatile private var videoSource = VideoSource.WIFI
     private val frameMatrix = Matrix()
     private val frameSrcCorners = FloatArray(8)
     private val frameDstCorners = FloatArray(8)
@@ -156,6 +163,7 @@ class MainActivity : Activity() {
     @Volatile private var zoomTextUntil = 0L
 
     private lateinit var btnConnect: Button
+    private lateinit var btnVideoSource: Button
     private lateinit var btnGallery: Button
     private lateinit var btnGeotag: Button
     private val zoomChips = mutableListOf<Button>()
@@ -320,8 +328,15 @@ class MainActivity : Activity() {
         mirror = getPreferences(MODE_PRIVATE).getBoolean("mirror", false)
         hudOn = getPreferences(MODE_PRIVATE).getBoolean("hud", true)
         panelTab = getPreferences(MODE_PRIVATE).getInt("panel_tab", 0).coerceIn(0, 2)
+        videoSource = VideoSource.entries.getOrElse(
+            getPreferences(MODE_PRIVATE).getInt("video_source", VideoSource.WIFI.ordinal)
+        ) { VideoSource.WIFI }
 
         val root = FrameLayout(this)
+        // Superficie diminuta y oculta tras el monitor. SurfaceFlinger consume
+        // aqui la salida UVC mientras el callback entrega los frames al renderer.
+        uvcPreviewSink = SurfaceView(this)
+        root.addView(uvcPreviewSink, FrameLayout.LayoutParams(2, 2))
         surface = SurfaceView(this)
         surface.setOnTouchListener { v, ev -> onSurfaceTouch(v, ev) }
         root.addView(surface)
@@ -335,6 +350,11 @@ class MainActivity : Activity() {
         super.onStart()
         GeotagManager.start(applicationContext)
         updateGeotagChip()
+        if (videoSource == VideoSource.HDMI &&
+            checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(Manifest.permission.CAMERA), CAMERA_PERMISSION_REQUEST)
+        }
         openingGallery = false
         val thread = synchronized(lifecycleLock) {
             if (active) return
@@ -349,16 +369,18 @@ class MainActivity : Activity() {
     override fun onStop() {
         super.onStop()
         GeotagManager.stop()
-        val (stream, thread) = synchronized(lifecycleLock) {
+        val (stream, uvc, thread) = synchronized(lifecycleLock) {
             active = false
             sessionGeneration.incrementAndGet()
-            val result = currentStream to worker
+            val result = Triple(currentStream, currentUvcSource, worker)
             currentStream = null
+            currentUvcSource = null
             worker = null
             result
         }
         // close() despierta inmediatamente cualquier lectura/espera de red.
         stream?.stop()
+        uvc?.stop()
         thread?.interrupt()
         SonyCamera.cancelEventWait()
         wifiLock?.let { if (it.isHeld) it.release() }
@@ -383,6 +405,44 @@ class MainActivity : Activity() {
                 true
             }
         }
+
+    private fun registerUvcSource(source: UvcVideoSource, generation: Int): Boolean =
+        synchronized(lifecycleLock) {
+            if (!isSessionActive(generation)) false
+            else {
+                currentUvcSource = source
+                true
+            }
+        }
+
+    private fun clearUvcSource(source: UvcVideoSource) {
+        synchronized(lifecycleLock) {
+            if (currentUvcSource === source) currentUvcSource = null
+        }
+    }
+
+    /** Reinicia solamente el transporte de video al alternar WiFi/HDMI. */
+    private fun restartMonitor() {
+        var oldStream: LiveviewStream? = null
+        var oldUvc: UvcVideoSource? = null
+        var oldWorker: Thread? = null
+        lateinit var replacement: Thread
+        synchronized(lifecycleLock) {
+            if (!active) return
+            val generation = sessionGeneration.incrementAndGet()
+            oldStream = currentStream
+            oldUvc = currentUvcSource
+            oldWorker = worker
+            currentStream = null
+            currentUvcSource = null
+            replacement = Thread({ monitorLoop(generation) }, "monitor")
+            worker = replacement
+        }
+        oldStream?.stop()
+        oldUvc?.stop()
+        oldWorker?.interrupt()
+        replacement.start()
+    }
 
     private fun clearStream(stream: LiveviewStream) {
         synchronized(lifecycleLock) {
@@ -585,6 +645,21 @@ class MainActivity : Activity() {
         // Botones de la app, en el mismo panel para que nada flote sobre
         // el monitor. Conectar: un toque conecta con lo guardado; mantener
         // pulsado edita las credenciales.
+        btnVideoSource = chip(
+            appChips, if (videoSource == VideoSource.HDMI) "Video: HDMI" else "Video: WiFi"
+        ) {
+            videoSource = if (videoSource == VideoSource.WIFI) VideoSource.HDMI else VideoSource.WIFI
+            getPreferences(MODE_PRIVATE).edit().putInt("video_source", videoSource.ordinal).apply()
+            btnVideoSource.text = if (videoSource == VideoSource.HDMI) "Video: HDMI" else "Video: WiFi"
+            highlightValue(btnVideoSource, videoSource == VideoSource.HDMI)
+            if (videoSource == VideoSource.HDMI &&
+                checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED
+            ) {
+                requestPermissions(arrayOf(Manifest.permission.CAMERA), CAMERA_PERMISSION_REQUEST)
+            }
+            restartMonitor()
+        }
+        highlightValue(btnVideoSource, videoSource == VideoSource.HDMI)
         btnConnect = chip(appChips, "Connect") {
             when {
                 directNetwork != null -> disconnectCamera()
@@ -778,6 +853,10 @@ class MainActivity : Activity() {
     /** Abre/cierra la tira horizontal de valores de un ajuste. Cada valor se
      *  aplica al instante y la tira permanece abierta para seguir ajustando. */
     private fun toggleValueStrip(setting: Setting) {
+        if (setting.title == "Drive") {
+            toggleDriveStrip(setting)
+            return
+        }
         if (openSetting === setting) {
             closeValueStrip()
             return
@@ -793,6 +872,58 @@ class MainActivity : Activity() {
                 runOnUiThread { if (openSetting === setting) fillValueStrip(setting, values, current) }
             } catch (e: Exception) {
                 toast("${setting.title}: ${e.message}")
+                runOnUiThread { closeValueStrip() }
+            }
+        }
+    }
+
+    /** Drive usa objetos JSON, a diferencia de ISO, apertura, etc. La a6000
+     *  publica que este setter no esta disponible, aunque conozca sus valores. */
+    private fun toggleDriveStrip(setting: Setting) {
+        if (openSetting === setting) {
+            closeValueStrip()
+            return
+        }
+        setStripOwner(setting, chips[setting])
+        apiExecutor.execute {
+            if (shootMode == "movie") {
+                toast("Drive: available only in Photo mode")
+                runOnUiThread { closeValueStrip() }
+                return@execute
+            }
+            // No usar getAvailableApiList como bloqueo: una app de camara
+            // parcheada puede aceptar metodos que no anuncia en esa lista.
+            if (CameraCompatibility.isA6000(SonyCamera.modelName)) {
+                toast(CameraCompatibility.driveUnavailableMessage(SonyCamera.modelName))
+                runOnUiThread { closeValueStrip() }
+                return@execute
+            }
+            try {
+                val state = SonyCamera.call(SonyCamera.cameraEndpoint, setting.getMethod).getJSONObject(0)
+                val current = state.getString("contShootingMode")
+                val candidates = state.getJSONArray("candidate")
+                val values = List(candidates.length()) { candidates.getString(it) }
+                if (values.isEmpty()) throw CameraException("not available in this mode")
+                runOnUiThread {
+                    if (openSetting === setting) {
+                        showValueStrip(setting, values, current) { value, view ->
+                            applySetting(
+                                setting.setMethod,
+                                JSONObject().put("contShootingMode", value),
+                            ) {
+                                chips[setting]?.text = setting.chipLabel(value)
+                                markSelected(view)
+                            }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                val unavailable = e.message?.contains("Not Available Now", ignoreCase = true) == true
+                toast(if (unavailable) {
+                    CameraCompatibility.driveUnavailableMessage(SonyCamera.modelName)
+                } else {
+                    "Drive: ${e.message}"
+                })
                 runOnUiThread { closeValueStrip() }
             }
         }
@@ -945,10 +1076,11 @@ class MainActivity : Activity() {
                     showValueStrip("WB", modes, current) { mode, view ->
                         apiExecutor.execute {
                             try {
+                                cancelTouchFocusBeforeSetting()
                                 // Para "Color Temperature" hace falta un kelvin: 5500 por defecto
                                 val temp = mode == "Color Temperature"
-                                SonyCamera.call(
-                                    SonyCamera.cameraEndpoint, "setWhiteBalance",
+                                callSettingWhenAvailable(
+                                    "setWhiteBalance",
                                     JSONArray().put(mode).put(temp).put(if (temp) 5500 else 0),
                                 )
                                 runOnUiThread {
@@ -1016,12 +1148,36 @@ class MainActivity : Activity() {
     private fun applySetting(setMethod: String, value: Any, onOk: () -> Unit) {
         apiExecutor.execute {
             try {
-                SonyCamera.call(SonyCamera.cameraEndpoint, setMethod, JSONArray().put(value))
+                cancelTouchFocusBeforeSetting()
+                callSettingWhenAvailable(setMethod, JSONArray().put(value))
                 runOnUiThread(onOk)
             } catch (e: Exception) {
                 toast("Error: ${e.message}")
             }
         }
+    }
+
+    /** Sony bloquea temporalmente ISO, WB, modo, etc. mientras sigue activo el
+     * enfoque tactil. Se cancela antes de cambiar un ajuste y se tolera el breve
+     * estado de transicion que algunos modelos notifican como error 1. */
+    private fun cancelTouchFocusBeforeSetting() {
+        if (!touchFocusActive) return
+        runCatching { callSettingWhenAvailable("cancelTouchAFPosition") }
+        touchFocusActive = false
+    }
+
+    private fun callSettingWhenAvailable(method: String, params: JSONArray = JSONArray()): JSONArray {
+        val delaysMs = longArrayOf(150, 300, 600)
+        for (attempt in 0..delaysMs.size) {
+            try {
+                return SonyCamera.call(SonyCamera.cameraEndpoint, method, params)
+            } catch (e: CameraException) {
+                val temporarilyBusy = e.message?.contains("[1] Not Available Now", ignoreCase = true) == true
+                if (!temporarilyBusy || attempt == delaysMs.size) throw e
+                SystemClock.sleep(delaysMs[attempt])
+            }
+        }
+        throw CameraException("$method failed")
     }
 
     /** Actualiza las etiquetas de los chips con los valores actuales de la camara. */
@@ -1030,17 +1186,27 @@ class MainActivity : Activity() {
             val currentByTitle = mutableMapOf<String, String>()
             settings.forEach { setting ->
                 runCatching {
-                    currentByTitle[setting.title] = SonyCamera.call(
+                    val result = SonyCamera.call(
                         SonyCamera.cameraEndpoint, setting.currentMethod,
-                    ).get(0).toString()
+                    )
+                    currentByTitle[setting.title] = if (setting.title == "Drive") {
+                        result.getJSONObject(0).getString("contShootingMode")
+                    } else {
+                        result.get(0).toString()
+                    }
                 }
             }
             settings.forEach { s ->
                 if (!currentByTitle.containsKey(s.title)) {
                     runCatching {
-                        currentByTitle[s.title] = SonyCamera.call(
+                        val result = SonyCamera.call(
                             SonyCamera.cameraEndpoint, s.getMethod,
-                        ).get(0).toString()
+                        )
+                        currentByTitle[s.title] = if (s.title == "Drive") {
+                            result.getJSONObject(0).getString("contShootingMode")
+                        } else {
+                            result.get(0).toString()
+                        }
                     }
                 }
             }
@@ -1117,6 +1283,7 @@ class MainActivity : Activity() {
             "currentShutterSpeed" to "Shutter",
             "currentFNumber" to "Aperture",
             "currentFocusMode" to "Focus",
+            "currentContShootingMode" to "Drive",
             "currentFlashMode" to "Flash",
             "currentSelfTimer" to "Timer",
         )
@@ -1360,6 +1527,22 @@ class MainActivity : Activity() {
             updateGeotagChip()
             return
         }
+        if (requestCode == CAMERA_PERMISSION_REQUEST) {
+            if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
+                toast("HDMI capture enabled")
+                restartMonitor()
+            } else {
+                videoSource = VideoSource.WIFI
+                getPreferences(MODE_PRIVATE).edit().putInt("video_source", videoSource.ordinal).apply()
+                if (::btnVideoSource.isInitialized) {
+                    btnVideoSource.text = "Video: WiFi"
+                    highlightValue(btnVideoSource, false)
+                }
+                toast("Camera permission is required for the HDMI capture device")
+                restartMonitor()
+            }
+            return
+        }
         if (requestCode != WIFI_PERMISSION_REQUEST) return
         val credentials = pendingWifiCredentials
         pendingWifiCredentials = null
@@ -1556,7 +1739,9 @@ class MainActivity : Activity() {
                     SonyCamera.cameraEndpoint, "setTouchAFPosition",
                     JSONArray().put(xPct).put(yPct),
                 )
+                touchFocusActive = true
             } catch (e: Exception) {
+                touchFocusActive = false
                 toast("Focus: ${e.message}")
             }
         }
@@ -1573,6 +1758,16 @@ class MainActivity : Activity() {
     private fun monitorLoop(generation: Int) {
         while (isSessionActive(generation)) {
             try {
+                if (videoSource == VideoSource.HDMI) {
+                    if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+                        drawMessage("HDMI capture needs camera permission...")
+                        SystemClock.sleep(500)
+                        continue
+                    }
+                    connectControlsForHdmi(generation)
+                    streamUvcAndRender(generation)
+                    continue
+                }
                 drawMessage("Waiting for camera WiFi...\n(Connect button in the panel)")
                 bindToWifi()
                 drawMessage("Connecting to the camera...")
@@ -1591,6 +1786,94 @@ class MainActivity : Activity() {
                 drawMessage("Error: ${e.message ?: e.javaClass.simpleName}\nRetrying...")
                 SystemClock.sleep(2000)
             }
+        }
+    }
+
+    /** La imagen llega por HDMI, pero los ajustes y eventos siguen usando la
+     * API WiFi de Sony. Un fallo WiFi nunca detiene la previsualizacion UVC. */
+    private fun connectControlsForHdmi(generation: Int) {
+        apiExecutor.execute {
+            while (isSessionActive(generation) && videoSource == VideoSource.HDMI) {
+                val connected = runCatching {
+                    bindToWifi()
+                    SonyCamera.locate()
+                }.getOrDefault(false)
+                if (connected && isSessionActive(generation)) {
+                    refreshChips()
+                    startCameraEventListener(generation)
+                    return@execute
+                }
+                SystemClock.sleep(3000)
+            }
+        }
+    }
+
+    private fun streamUvcAndRender(generation: Int) {
+        val source = UvcVideoSource(applicationContext, uvcPreviewSink)
+        source.start()
+        if (!registerUvcSource(source, generation)) {
+            source.destroy()
+            return
+        }
+
+        var bitmap: Bitmap? = null
+        var fps = 0f
+        var fpsWindowStart = SystemClock.elapsedRealtime()
+        var fpsWindowCount = 0
+        var lastFrameAt = fpsWindowStart
+        var exposure: Exposure? = null
+        var lastMeterAt = 0L
+        val peakingProcessor = FocusPeakingProcessor()
+        var peakingOverlay: Bitmap? = null
+        var lastPeakingAt = 0L
+
+        try {
+            while (isSessionActive(generation) && videoSource == VideoSource.HDMI) {
+                val frame = source.awaitFrame(250)
+                val now = SystemClock.elapsedRealtime()
+                if (frame == null) {
+                    val stalled = now - lastFrameAt
+                    val alert = if (stalled > 1200) source.status else null
+                    drawFrame(bitmap, alert, fps, -1, source.framesDropped, exposure, peakingOverlay)
+                    continue
+                }
+
+                val previous = bitmap
+                bitmap = frame.bitmap
+                fpsWindowCount++
+                lastFrameAt = now
+                if (now - fpsWindowStart >= 1000) {
+                    fps = fpsWindowCount * 1000f / (now - fpsWindowStart)
+                    fpsWindowStart = now
+                    fpsWindowCount = 0
+                }
+
+                exposure = when {
+                    !meterOn -> null
+                    now - lastMeterAt >= 150 -> {
+                        lastMeterAt = now
+                        computeExposure(bitmap)
+                    }
+                    else -> exposure
+                }
+                peakingOverlay = when {
+                    peakingColor == PeakingColor.OFF -> null
+                    now - lastPeakingAt >= 120 -> {
+                        lastPeakingAt = now
+                        peakingProcessor.compute(bitmap, peakingColor, peakingSensitivity)
+                    }
+                    else -> peakingOverlay
+                }
+                drawFrame(
+                    bitmap, null, fps, now - frame.receivedAtMs, source.framesDropped,
+                    exposure, peakingOverlay,
+                )
+                previous?.takeIf { it !== bitmap }?.recycle()
+            }
+        } finally {
+            bitmap?.recycle()
+            source.destroy()
+            clearUvcSource(source)
         }
     }
 

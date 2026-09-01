@@ -1,5 +1,53 @@
 # Release notes
 
+## v0.11
+
+**New**
+
+- Added a selectable `Video: HDMI` source. Android accepts standard HDMI-to-UVC
+  capture devices over USB-OTG; USB-C iPads use AVFoundation external-camera
+  support. iPhone is intentionally excluded.
+- HDMI supplies the low-latency image while Sony Wi-Fi remains available in
+  parallel for exposure controls, touch focus, shutter events and card access.
+- The HDMI path keeps only the latest frame and retains the existing rotation,
+  mirror, grid, exposure meter, focus peaking and HUD processing.
+
+**Fixed and compatibility**
+
+- Added the missing continuous-shooting/drive control and cancel touch AF before
+  setting changes, with bounded retries for Sony's transient `Not Available Now`.
+- Drive now follows Sony's object-based API format, enabling it on compatible models
+  such as the A6300. The A6000 receives a specific incompatibility explanation, while
+  other models receive an accurate current-mode/state message when Sony rejects it.
+- Camera-model discovery now also runs when the usual A6000 address responds, so
+  model-specific compatibility messages do not depend on a failed direct connection.
+- Capability lists remain fail-open: patched Sony camera apps can use working commands
+  even when those commands are absent from `getAvailableApiList`.
+
+**Important A6000 limitations**
+
+- Cable video requires the camera's micro-HDMI output, an HDMI capture card and USB
+  OTG/USB-C on the mobile device. The camera's Multi/Micro USB port is not a video feed.
+- HDMI supplies preview frames only. Camera control still uses Sony Wi-Fi, and iPhone
+  is excluded because this UVC input path is not available there.
+- The A6000 API does not expose a downloadable video path, so videos recorded on the
+  camera cannot be saved into or downloaded by the mobile app.
+- Remote touch focus is not available while the A6000 is in video mode/recording; use
+  the camera's video autofocus settings such as AF-C instead.
+- The A6000 does not expose remote burst/Drive control. The app now explains this
+  directly instead of showing Sony's generic `Not Available Now` error.
+
+**Downloads**
+
+- `SonyLiveMonitor-Installer-v0.11-windows.exe` — desktop installer (Windows).
+- `SonyLiveMonitor-Installer-v0.11-macos.dmg` — desktop installer (macOS).
+- `SonyLiveMonitor-Installer-v0.11-linux` — desktop installer (Linux).
+- `SonyLiveMonitor-v0.11.apk` — Android phone app.
+- `SonyLiveMonitor-v0.11-unsigned.ipa` — iOS/iPadOS, sideload with AltStore.
+- `SonyLiveMonitor-a6000-avcontent-ONLY-FOR-CAMERA.apk` — unchanged patched
+  camera app (do **not** install it on the phone).
+- `SmartRemote-a6000-original-v4.30.apk` — Sony's original camera app.
+
 ## v0.10
 
 **New**

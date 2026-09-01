@@ -15,13 +15,13 @@ val hasReleaseSigning = listOf(
 ).all { !it.isNullOrBlank() }
 
 val appVersionCode = providers.gradleProperty("versionCode")
-    .orNull?.toIntOrNull() ?: 10
+    .orNull?.toIntOrNull() ?: 11
 val appVersionName = providers.gradleProperty("versionName")
-    .orNull ?: "0.10"
+    .orNull ?: "0.11"
 
 android {
     namespace = "com.otoniel.sonylivemonitor"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.otoniel.sonylivemonitor"
@@ -64,6 +64,8 @@ android {
 
 dependencies {
     implementation("androidx.exifinterface:exifinterface:1.4.2")
+    implementation("com.github.ernestp.AndroidUSBCamera:libausbc:3.6.0")
+    implementation("com.github.ernestp.AndroidUSBCamera:libuvc:3.6.0")
     testImplementation("junit:junit:4.13.2")
 }
 

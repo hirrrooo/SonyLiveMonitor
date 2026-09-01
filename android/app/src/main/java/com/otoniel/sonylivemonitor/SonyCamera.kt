@@ -106,7 +106,15 @@ object SonyCamera {
      * IP tipica de la a6000). Bloqueante: llamar fuera del hilo de UI.
      */
     fun locate(): Boolean {
-        val found = ping() || (discover() && ping())
+        val directFound = ping()
+        // La IP fija de la a6000 suele responder antes de necesitar SSDP. Aun
+        // asi hacemos un descubrimiento corto una vez para conocer el modelo.
+        val found = if (directFound) {
+            if (modelName == null) discover(timeoutMs = 1200)
+            true
+        } else {
+            discover() && ping()
+        }
         if (found) refreshCapabilities()
         return found
     }
@@ -115,10 +123,12 @@ object SonyCamera {
         runCatching { call(cameraEndpoint, "getVersions") }.isSuccess
 
     private fun refreshCapabilities() {
-        apiList = runCatching {
+        runCatching {
             val arr = call(cameraEndpoint, "getAvailableApiList").getJSONArray(0)
             buildSet { for (i in 0 until arr.length()) add(arr.getString(i)) }
-        }.getOrDefault(apiList)
+        }.onSuccess {
+            apiList = it
+        }
     }
 
     /** M-SEARCH SSDP; si la camara responde, actualiza los endpoints. */

@@ -345,6 +345,12 @@ struct ControlPanel: View {
                     ChipButton(label: "HUD: \(model.hudOn ? "on" : "off")",
                                active: model.hudOn) { model.toggleHud() }
                 default:
+                    if UIDevice.current.userInterfaceIdiom == .pad {
+                        ChipButton(label: "Video: \(model.videoSource.label)",
+                                   active: model.videoSource == .hdmi) {
+                            model.toggleVideoSource()
+                        }
+                    }
                     ChipButton(label: "WiFi") { model.showConnectHelp = true }
                     ChipButton(label: "Camera card") { model.openGallery() }
                     ChipButton(label: "Location: \(model.geotagEnabled ? "on" : "off")",

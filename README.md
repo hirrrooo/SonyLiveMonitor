@@ -56,6 +56,9 @@ the reference if something fails.
 ## Features
 
 - **Full-screen live view** with a HUD (fps, frame age, dropped frames).
+- **Optional wired HDMI monitor** on Android USB-OTG and USB-C iPads: connect
+  the camera's Micro-HDMI Type-D output through a UVC HDMI capture device and
+  select `App > Video: HDMI`. Wi-Fi can remain connected for camera controls.
 - **Live view keeps running while recording** — press MOVIE on the camera, or
   start recording from the app, and keep monitoring on the phone.
 - **Exposure meter** computed from the live view: luminance histogram, EV
@@ -66,8 +69,10 @@ the reference if something fails.
 - **Framing grids**: thirds, thirds + diagonals, or centre cross.
 - **Camera controls**: ISO, shutter, aperture, EV compensation, white balance,
   drive mode, flash, timer, powered zoom and shutter release. Available values
-  are queried from the camera according to the mode dial.
-- **Touch focus** by tapping the image (`setTouchAFPosition`).
+  are queried from the camera according to the mode dial. The a6000 does not
+  expose remote burst/drive selection, so the app reports that limitation.
+- **Touch focus** by tapping the image (`setTouchAFPosition`) when exposed by
+  the camera; the a6000 does not provide it during video recording.
 - **Mirror preview** for filming yourself while watching the monitor. It only
   transforms the preview — the recording is never flipped — and touch focus is
   corrected automatically while active.
@@ -91,6 +96,18 @@ the reference if something fails.
 
 Android saves to `Download/SonyLiveMonitor`; iOS saves to the Files app under
 *Sony Live Monitor*. Either can be pointed at a folder you pick.
+
+### HDMI capture setup
+
+The camera's Micro/Multi-USB port does not carry video. Use this chain instead:
+
+`camera Micro-HDMI Type-D -> HDMI cable -> UVC capture device -> USB-C/OTG device`
+
+Set `HDMI Info. Display` to `Off` for a clean image and start with HDMI output at
+1080p for the widest capture-device compatibility. Android requires USB host/OTG.
+On Apple devices this feature requires a USB-C iPad running iPadOS 17 or later;
+iPhone is not supported. The capture device supplies video only, so keep the
+camera Wi-Fi connected when ISO, focus, shutter and card-gallery controls are needed.
 
 ---
 
