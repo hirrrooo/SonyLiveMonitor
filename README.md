@@ -178,6 +178,7 @@ python monitor.py
 | `--no-hud` | Hide the fps/latency overlay |
 | `--webcam` | Publish the Python live view to a virtual webcam (preview stays open) |
 | `--no-preview` | With `--webcam`, publish without an OpenCV window; quit with Ctrl+C |
+| `--fps 15` | Set webcam output cadence; does not increase the camera's source frame rate |
 
 Quit with `q` or `ESC`.
 
@@ -198,7 +199,12 @@ running. The OpenCV preview and virtual camera run together; use
 `python monitor.py --webcam --no-preview` to omit the preview. To bypass SSDP
 discovery, pass `--endpoint http://192.168.122.1:8080/sony/camera` (or another
 verified camera API endpoint). Output starts at the decoded live-view resolution
-and a nominal 25 fps. The console reports input/output fps and parser drops.
+and a nominal 25 fps. The console separates parsed stream fps, decoded frames
+used by the webcam, output fps, repeated output frames, and parser drops. Local
+frame age measures only time since the JPEG reached the PC, not camera-to-app
+latency. At larger live-view sizes, try `--no-preview` or `--scale 1` if PC load
+is high. `--fps 15` can reduce PC work when the source itself supplies about
+15 fps, but it cannot create additional camera frames.
 
 The virtual camera repeats the latest frame across brief camera pauses and
 switches to black after two seconds without a new frame. It closes after 30

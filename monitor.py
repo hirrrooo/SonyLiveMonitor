@@ -34,6 +34,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-hud", action="store_true", help="Ocultar overlay de FPS/latencia")
     p.add_argument("--webcam", action="store_true", help="Publicar el liveview en una camara virtual")
     p.add_argument("--no-preview", action="store_true", help="Ocultar la ventana en modo --webcam")
+    p.add_argument("--fps", type=int, default=25, help="FPS de salida de la webcam (por defecto 25)")
     return p.parse_args()
 
 
@@ -43,7 +44,7 @@ def draw_hud(img: np.ndarray, fps: float, age_ms: float, dropped: int) -> None:
     cv2.putText(img, text, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 128), 1, cv2.LINE_AA)
 
 
-def run_webcam(stream: LiveviewStream, *, preview: bool, scale: float) -> None:
+def run_webcam(stream: LiveviewStream, *, preview: bool, scale: float, fps: int) -> None:
     """Publish the newest decoded frame at a steady output rate."""
     import pyvirtualcam
 
@@ -55,13 +56,20 @@ def run_webcam(stream: LiveviewStream, *, preview: bool, scale: float) -> None:
     height, width = first.shape[:2]
     print(f"Liveview resolution: {width}x{height}", flush=True)
     window_start = time.monotonic()
-    window_received = 1
+    window_used = 0
+    window_sent = 0
+    window_age_ms = 0.0
+    frames_read_at_start = stream.frames_read
+    frames_dropped_at_start = stream.frames_dropped
     last_frame_at = window_start
+    last_received_at = frame.received_at
     image = first
     black = np.zeros_like(first)
+    preview_image = cv2.resize(first, None, fx=scale, fy=scale) if preview and scale != 1.0 else first
+    preview_black = np.zeros_like(preview_image) if preview else None
 
     # OpenCV already decodes into BGR. pyvirtualcam accepts this format directly.
-    with pyvirtualcam.Camera(width=width, height=height, fps=25,
+    with pyvirtualcam.Camera(width=width, height=height, fps=fps,
                              fmt=pyvirtualcam.PixelFormat.BGR) as webcam:
         print(f"Virtual camera: {webcam.device} ({webcam.backend})", flush=True)
         if preview:
@@ -75,31 +83,42 @@ def run_webcam(stream: LiveviewStream, *, preview: bool, scale: float) -> None:
                     if decoded.shape[:2] != (height, width):
                         decoded = cv2.resize(decoded, (width, height))
                     image = decoded
-                    window_received += 1
+                    if preview:
+                        preview_image = (cv2.resize(image, None, fx=scale, fy=scale)
+                                         if scale != 1.0 else image)
+                    window_used += 1
                     last_frame_at = now
+                    last_received_at = frame.received_at
 
             stalled = now - last_frame_at
             if stalled > 30:
                 raise TimeoutError("30s sin frames del liveview")
             webcam.send(image if stalled < 2 else black)
+            window_sent += 1
+            window_age_ms += max(0.0, (now - last_received_at) * 1000)
             if preview:
-                shown = image
-                if scale != 1.0:
-                    shown = cv2.resize(shown, None, fx=scale, fy=scale)
-                if stalled >= 2:
-                    shown = np.zeros_like(shown)
-                cv2.imshow(WINDOW, shown)
+                cv2.imshow(WINDOW, preview_image if stalled < 2 else preview_black)
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), 27) or cv2.getWindowProperty(WINDOW, cv2.WND_PROP_VISIBLE) < 1:
                     break
 
             if now - window_start >= 1:
-                fps = window_received / (now - window_start)
-                print(f"received {fps:.1f} fps | webcam {webcam.current_fps:.1f} fps | "
-                      f"dropped {stream.frames_dropped} | {width}x{height} | "
-                      f"frame age {stalled * 1000:.0f} ms", flush=True)
+                elapsed = now - window_start
+                read = stream.frames_read
+                dropped = stream.frames_dropped
+                print(f"stream {(read - frames_read_at_start) / elapsed:.1f} fps | "
+                      f"used {window_used / elapsed:.1f} fps | "
+                      f"webcam {webcam.current_fps:.1f} fps | "
+                      f"repeated {window_sent - window_used} | "
+                      f"dropped +{dropped - frames_dropped_at_start} ({dropped} total) | "
+                      f"local frame age {window_age_ms / window_sent:.0f} ms | "
+                      f"{width}x{height}", flush=True)
                 window_start = now
-                window_received = 0
+                frames_read_at_start = read
+                frames_dropped_at_start = dropped
+                window_used = 0
+                window_sent = 0
+                window_age_ms = 0.0
             webcam.sleep_until_next_frame()
 
 
@@ -107,6 +126,9 @@ def main() -> int:
     args = parse_args()
     if args.no_preview and not args.webcam:
         print("--no-preview requires --webcam", file=sys.stderr)
+        return 2
+    if args.fps <= 0:
+        print("--fps must be positive", file=sys.stderr)
         return 2
 
     print("Conectando con la camara..." if args.endpoint else "Buscando camara por SSDP...", flush=True)
@@ -136,7 +158,7 @@ def main() -> int:
     try:
         stream.start()
         if args.webcam:
-            run_webcam(stream, preview=not args.no_preview, scale=args.scale)
+            run_webcam(stream, preview=not args.no_preview, scale=args.scale, fps=args.fps)
             return 0
         cv2.namedWindow(WINDOW, cv2.WINDOW_AUTOSIZE)
         while True:
