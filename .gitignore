@@ -36,3 +36,4 @@ dist/
 # ---- Varios ----
 *.log
 .env
+.build/
