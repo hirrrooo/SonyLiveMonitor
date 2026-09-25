@@ -63,6 +63,14 @@ This establishes that Smart Remote explicitly resets Wi-Fi and requests AP/Group
 
 If station drops when Smart Remote starts, correlate logcat and process transitions with the identified `SRCtrlRootState` Wi-Fi reset and group-owner startup; examine Sony framework/native effects and actual server bind addresses. There is no basis yet for asserting a small APK patch will work: service startup is tied to group creation, the returned URLs are fixed to AP IP, and the radio/platform may not support concurrent operation. Any experiment that replaces an APK needs an original backup and a separately reviewable patch source; no binary patch was attempted here.
 
+Example read-only API probe once `LAN_IP` is known (replace the placeholder):
+
+```sh
+curl --max-time 5 -H 'Content-Type: application/json' \
+  -d '{"method":"getVersions","params":[],"id":1,"version":"1.0"}' \
+  http://LAN_IP:8080/sony/camera
+```
+
 For LAN discovery, manual `--endpoint` (or a later `--camera-ip` convenience option) is enough for a prototype, but the returned live-view URL may require a diagnostic LAN-host rewrite. Existing SSDP discovery may receive a LAN response yet parse the hardcoded AP endpoint from the XML. Fix the advertisement or validate a client-side override before adding mDNS or subnet scans; neither is evidenced in this repository.
 
 ## Implementation and contribution plan
