@@ -176,8 +176,43 @@ python monitor.py
 | `--size L` | Request a larger live view if the camera supports it |
 | `--scale 2` | Window scale factor (default 2x) |
 | `--no-hud` | Hide the fps/latency overlay |
+| `--webcam` | Publish the Python live view to a virtual webcam (preview stays open) |
+| `--no-preview` | With `--webcam`, publish without an OpenCV window; quit with Ctrl+C |
 
 Quit with `q` or `ESC`.
+
+### Python virtual webcam (experimental)
+
+Install [OBS Studio](https://obsproject.com/) on Windows so its virtual camera
+device is available, then install the optional Python dependencies:
+
+```
+python -m pip install -r requirements-webcam.txt
+python monitor.py --webcam
+```
+
+Put the camera in its Smart Remote/SonyLiveMonitor application and connect the PC
+to its `DIRECT-xxxx:ILCE-6000` Wi-Fi first. In Discord, Zoom, Teams or a browser
+webcam test, select **OBS Virtual Camera**. The Python process must remain
+running. The OpenCV preview and virtual camera run together; use
+`python monitor.py --webcam --no-preview` to omit the preview. To bypass SSDP
+discovery, pass `--endpoint http://192.168.122.1:8080/sony/camera` (or another
+verified camera API endpoint). Output starts at the decoded live-view resolution
+and a nominal 25 fps. The console reports input/output fps and parser drops.
+
+The virtual camera repeats the latest frame across brief camera pauses and
+switches to black after two seconds without a new frame. It closes after 30
+seconds without frames or if the stream disconnects; start the command again
+after reconnecting. In preview mode quit with `q` or `ESC`; otherwise Ctrl+C.
+
+OBS has only one built-in virtual camera, so if OBS itself needs to capture and
+mix the Python feed before publishing its own virtual output, install
+[Unity Capture](https://github.com/schellingb/UnityCapture) as the Python camera
+backend. On macOS, pyvirtualcam uses OBS; on Linux it requires `v4l2loopback`.
+See [pyvirtualcam setup](https://github.com/letmaik/pyvirtualcam#supported-virtual-cameras).
+This mode still needs real a6000 and Windows application verification. Details
+and the infrastructure Wi-Fi research are in
+[`docs/desktop-webcam-investigation.md`](docs/desktop-webcam-investigation.md).
 
 - `sony_camera.py` — SSDP discovery and JSON-RPC API client.
 - `liveview_stream.py` — live view container parser with the "latest frame only"
